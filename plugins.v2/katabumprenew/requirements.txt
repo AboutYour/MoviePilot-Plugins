@@ -1,0 +1,2 @@
+# 无需额外依赖：playwright、pytz 均由 MoviePilot 容器内置。
+# chromium 二进制由插件首次运行时自动安装（playwright install chromium）。

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.8"
+ENGINE_VERSION = "1.3.9"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -218,7 +218,7 @@ def build_cf_host_resolver_rules(logger=None, wildcard: bool = False) -> str:
     """
     生成 Chromium --host-resolver-rules。
 
-    v1.3.8 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
+    v1.3.9 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
     说明出口没有问题；强行把 *.challenges.cloudflare.com 映射到主域 IP
     可能让 Cloudflare 动态挑战资源出现 net::ERR_ABORTED / 空 iframe。
     因此默认只映射稳定主机，随机挑战子域优先交给 Chromium DoH 解析。
@@ -269,7 +269,7 @@ def nas_chromium_runtime_args() -> List[str]:
         "--use-gl=swiftshader",
         "--ignore-gpu-blocklist",
         "--enable-unsafe-swiftshader",
-        # v1.3.8: 不再禁用 site isolation / VizDisplayCompositor。Turnstile 依赖跨域 iframe，
+        # v1.3.9: 不再禁用 site isolation / VizDisplayCompositor。Turnstile 依赖跨域 iframe，
         # 这些参数在部分容器 Chromium 中会造成空 iframe 或 crashed_retry。
         "--font-render-hinting=none",
         "--password-store=basic",
@@ -573,7 +573,7 @@ async def _rescue_blank_turnstile(page, logger) -> bool:
     """温和处理 Turnstile 空 iframe。
 
     v1.3.5 会删除空 iframe 并重渲染；从日志看这可能打断 Cloudflare 自己的 crashed_retry。
-    v1.3.8 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
+    v1.3.9 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
     只有设置 KATABUMP_TURNSTILE_FORCE_RERENDER=1 时才启用旧的强制重渲染。
     """
     force = (os.environ.get("KATABUMP_TURNSTILE_FORCE_RERENDER") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -1238,6 +1238,11 @@ DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
 
+def is_cdp_endpoint(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return v.startswith("http://") or v.startswith("https://") or v.startswith("ws://") or v.startswith("wss://")
+
+
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
                   logger=None, chrome_path: str = "", turnstile_wait: int = 120,
                   renew_attempts: int = 3, headless: bool = False,
@@ -1259,7 +1264,9 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
     if saved_proxy_env:
         _log(logger, f"已临时清除环境代理变量（改由 Playwright proxy 注入）: {list(saved_proxy_env.keys())}")
 
-    exe = chrome_path.strip() or ensure_chromium(logger)
+    chrome_target = (chrome_path or "").strip()
+    cdp_endpoint = chrome_target if is_cdp_endpoint(chrome_target) else ""
+    exe = "" if cdp_endpoint else (chrome_target or ensure_chromium(logger))
     ua = user_agent.strip() or DEFAULT_UA
     results = []
     # 注意：不要加 --disable-background-networking，会干扰 DoH / CF 挑战资源加载
@@ -1299,7 +1306,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式 v1.3.8：保留跨域 iframe 隔离能力，启用 Chrome 138 UA、DoH 与可见浏览器交互模拟")
+        _log(logger, "NAS 兼容模式 v1.3.9：支持外部 Chrome/CDP；容器 Chromium 失败时可复用宿主机真实 Chrome")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 
@@ -1316,7 +1323,13 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                              f"{' (带认证)' if proxy_dict.get('username') else ''}")
 
             browser = None
-            if exe:
+            if cdp_endpoint:
+                try:
+                    browser = await p.chromium.connect_over_cdp(cdp_endpoint, timeout=30000)
+                    _log(logger, f"使用外部 Chrome/CDP: {cdp_endpoint}")
+                except Exception as e:
+                    _log(logger, f"外部 Chrome/CDP 连接失败({e})，回退容器内 Chromium")
+            if browser is None and exe:
                 try:
                     browser = await p.chromium.launch(executable_path=exe, **launch_kwargs)
                     _log(logger, f"使用浏览器: {exe}")

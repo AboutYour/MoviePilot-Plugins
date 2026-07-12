@@ -11,14 +11,18 @@ Katabump 续期核心引擎（Python + Playwright）。
 import asyncio
 import glob
 import os
+import random
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
+
+ENGINE_VERSION = "1.3.0"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -29,6 +33,26 @@ CF_PROBE_HOSTS = (
     "challenges.cloudflare.com",
     "cdn-cgi.cloudflare.com",
 )
+# 需要预解析/强制映射的 CF 主机（Turnstile 还会用随机子域 *.challenges.cloudflare.com）
+CF_MAP_HOSTS = (
+    "challenges.cloudflare.com",
+    "cdn-cgi.cloudflare.com",
+    "static.cloudflareinsights.com",
+)
+PUBLIC_DNS_SERVERS = (
+    "223.5.5.5",      # 阿里
+    "119.29.29.29",   # DNSPod
+    "8.8.8.8",
+    "1.1.1.1",
+)
+# Chromium DoH 模板（系统 DNS 坏时让浏览器自己解析）
+DOH_TEMPLATES = (
+    "https://dns.alidns.com/dns-query",
+    "https://doh.pub/dns-query",
+    "https://chrome.cloudflare-dns.com/dns-query",
+    "https://dns.google/dns-query",
+)
+
 CF_URL_RE = re.compile(
     r"cloudflare|turnstile|challenges\.cloudflare\.com|cdn-cgi",
     re.I,
@@ -57,14 +81,151 @@ def _log(logger, msg: str):
 
 
 # ============================================================
+# 公共 DNS 预解析（绕过容器坏掉的 /etc/resolv.conf）
+# ============================================================
+def _dns_query_a(hostname: str, dns_server: str, timeout: float = 3.0) -> List[str]:
+    """向指定公共 DNS 发起 A 查询，不依赖系统 resolver。"""
+    name = (hostname or "").strip().rstrip(".")
+    if not name:
+        return []
+    tid = random.randint(0, 65535)
+    header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    qname = b""
+    for part in name.split("."):
+        p = part.encode("idna")
+        if len(p) > 63:
+            return []
+        qname += bytes([len(p)]) + p
+    qname += b"\x00" + struct.pack("!HH", 1, 1)  # A IN
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(header + qname, (dns_server, 53))
+        data, _ = sock.recvfrom(4096)
+    except Exception:
+        return []
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    if len(data) < 12:
+        return []
+    ancount = struct.unpack("!H", data[6:8])[0]
+    i = 12
+    # skip question
+    try:
+        while i < len(data) and data[i] != 0:
+            i += 1 + data[i]
+        i += 5  # 0 + type + class
+    except Exception:
+        return []
+    ips: List[str] = []
+    for _ in range(ancount):
+        if i >= len(data):
+            break
+        try:
+            if data[i] & 0xC0 == 0xC0:
+                i += 2
+            else:
+                while i < len(data) and data[i] != 0:
+                    i += 1 + data[i]
+                i += 1
+            if i + 10 > len(data):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack("!HHIH", data[i:i + 10])
+            i += 10
+            rdata = data[i:i + rdlen]
+            i += rdlen
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(rdata))
+        except Exception:
+            break
+    return ips
+
+
+def resolve_a_public(hostname: str, logger=None) -> Optional[str]:
+    """用多个公共 DNS 解析主机名，返回第一个 A 记录。"""
+    for server in PUBLIC_DNS_SERVERS:
+        ips = _dns_query_a(hostname, server)
+        if ips:
+            _log(logger, f"公共 DNS {server} 解析 {hostname} -> {ips[0]}"
+                         f"{(' (+' + str(len(ips) - 1) + ')') if len(ips) > 1 else ''}")
+            return ips[0]
+    _log(logger, f"公共 DNS 均未能解析 {hostname}")
+    return None
+
+
+def build_cf_host_resolver_rules(logger=None) -> str:
+    """
+    生成 Chromium --host-resolver-rules。
+    把 challenges.cloudflare.com 及其通配子域映射到公共 DNS 解析出的 IP，
+    绕过容器内 ERR_NAME_NOT_RESOLVED。
+    """
+    rules: List[str] = []
+    main_ip = resolve_a_public("challenges.cloudflare.com", logger)
+    if main_ip:
+        rules.append(f"MAP challenges.cloudflare.com {main_ip}")
+        # Turnstile 会请求 brunhild.challenges.cloudflare.com 等随机子域
+        rules.append(f"MAP *.challenges.cloudflare.com {main_ip}")
+    for host in CF_MAP_HOSTS:
+        if host == "challenges.cloudflare.com":
+            continue
+        ip = resolve_a_public(host, logger)
+        if ip:
+            rules.append(f"MAP {host} {ip}")
+    # 排除本地
+    if rules:
+        rules.append("EXCLUDE localhost")
+        rules.append("EXCLUDE 127.0.0.1")
+    return ", ".join(rules)
+
+
+def chromium_doh_args() -> List[str]:
+    """启用浏览器 DNS-over-HTTPS，系统 resolv 失败时仍可解析。"""
+    templates = " ".join(DOH_TEMPLATES)
+    return [
+        "--dns-over-https-mode=secure",
+        f"--dns-over-https-templates={templates}",
+    ]
+
+
+# ============================================================
 # 代理解析 / Cloudflare 连通性探测
 # ============================================================
+def _moviepilot_proxy_raw() -> str:
+    """读取 MoviePilot 的 PROXY_HOST（环境变量或 settings）。"""
+    for k in ("PROXY_HOST", "proxy_host"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return v
+    try:
+        from app.core.config import settings  # type: ignore
+        v = getattr(settings, "PROXY_HOST", None) or getattr(settings, "proxy_host", None)
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _env_proxy_raw() -> str:
     for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         v = (os.environ.get(k) or "").strip()
         if v:
             return v
     return ""
+
+
+def _any_system_proxy_raw() -> Tuple[str, str]:
+    """返回 (raw, source_label)。优先 PROXY_HOST，其次 HTTP(S)_PROXY。"""
+    mp = _moviepilot_proxy_raw()
+    if mp:
+        return mp, "PROXY_HOST"
+    env = _env_proxy_raw()
+    if env:
+        return env, "HTTP(S)_PROXY"
+    return "", ""
 
 
 def parse_proxy_server(raw: str) -> Optional[Dict[str, str]]:
@@ -130,85 +291,94 @@ def _tcp_reachable(host: str, port: int = 443, timeout: float = 5.0) -> Tuple[bo
         return False, f"异常: {e}"
 
 
-def probe_cloudflare(logger=None, timeout: float = 5.0) -> bool:
-    """直连探测 challenges.cloudflare.com 是否可达（不走代理）。"""
+def probe_cloudflare(logger=None, timeout: float = 5.0) -> Tuple[bool, bool]:
+    """
+    直连探测 challenges.cloudflare.com。
+    返回 (tcp_ok, dns_failed)：
+      - tcp_ok: 至少有一个主机可连
+      - dns_failed: 系统 DNS 对所有探测主机都解析失败
+    """
     ok_any = False
+    dns_fail_all = True
     details = []
     for host in CF_PROBE_HOSTS:
         ok, reason = _tcp_reachable(host, 443, timeout)
         details.append(f"{host}={'ok' if ok else reason}")
         if ok:
             ok_any = True
+            dns_fail_all = False
+        elif "DNS" not in reason:
+            dns_fail_all = False
     _log(logger, "Cloudflare 直连探测: " + "; ".join(details))
-    return ok_any
+    return ok_any, dns_fail_all and not ok_any
 
 
 def resolve_browser_proxy(
     proxy_server: str,
     proxy_mode: str,
     logger=None,
-) -> Tuple[Optional[Dict[str, str]], str]:
+) -> Tuple[Optional[Dict[str, str]], str, bool]:
     """
     决定 Playwright 使用的代理。
 
     proxy_mode:
-      - auto   : 先测 CF 直连；不通再回退到配置代理 / 环境代理
-      - direct : 强制直连（并清环境代理）
-      - system : 用环境变量里的代理
+      - auto   : 先测 CF 直连；不通再回退配置代理 / PROXY_HOST / 环境代理
+      - direct : 强制直连
+      - system : 用 PROXY_HOST 或环境变量代理
       - custom : 只用配置里的 proxy_server
-    返回 (playwright_proxy_dict 或 None, 策略说明)
+    返回 (playwright_proxy_dict 或 None, 策略说明, need_dns_fix)
+      need_dns_fix=True 时启动 Chromium DoH + 公共 DNS host-resolver-rules
     """
     mode = (proxy_mode or "auto").strip().lower()
     if mode not in ("auto", "direct", "system", "custom"):
         mode = "auto"
 
     cfg_raw = (proxy_server or "").strip()
-    env_raw = _env_proxy_raw()
+    sys_raw, sys_src = _any_system_proxy_raw()
     cfg = parse_proxy_server(cfg_raw) if cfg_raw else None
-    env = parse_proxy_server(env_raw) if env_raw else None
+    sys_proxy = parse_proxy_server(sys_raw) if sys_raw else None
 
     if mode == "custom":
         if not cfg:
-            _log(logger, "proxy_mode=custom 但未填写代理，将直连")
-            return None, "custom→直连(未配置)"
+            _log(logger, "proxy_mode=custom 但未填写代理，将直连 + DNS 修复")
+            return None, "custom→直连(未配置)", True
         _log(logger, f"使用配置代理: {cfg.get('server')}")
-        return cfg, "custom"
+        return cfg, "custom", False
 
     if mode == "system":
-        if not env:
-            _log(logger, "proxy_mode=system 但环境无 HTTP(S)_PROXY，将直连")
-            return None, "system→直连(无环境代理)"
-        _log(logger, f"使用系统环境代理: {env.get('server')}")
-        return env, "system"
+        if not sys_proxy:
+            _log(logger, "proxy_mode=system 但无 PROXY_HOST/HTTP(S)_PROXY，将直连 + DNS 修复")
+            return None, "system→直连(无系统代理)", True
+        _log(logger, f"使用系统代理({sys_src}): {sys_proxy.get('server')}")
+        return sys_proxy, f"system({sys_src})", False
 
     if mode == "direct":
-        _log(logger, "强制直连（忽略配置/环境代理）")
-        return None, "direct"
+        _log(logger, "强制直连（忽略配置/系统代理），启用 DNS 修复以防容器 resolv 异常")
+        return None, "direct", True
 
     # ---- auto ----
-    # 配置里显式写了代理：优先用配置（用户意图最明确）
     if cfg:
         _log(logger, f"auto：使用配置代理 {cfg.get('server')}")
-        return cfg, "auto→custom"
+        return cfg, "auto→custom", False
 
-    # 无配置：先测 CF 直连
-    if probe_cloudflare(logger):
-        if env:
-            _log(logger, "auto：Cloudflare 直连可达，忽略环境代理，走住宅/本机出口")
+    tcp_ok, dns_failed = probe_cloudflare(logger)
+    if tcp_ok:
+        if sys_proxy:
+            _log(logger, "auto：Cloudflare 直连可达，忽略系统代理，走本机出口")
         else:
             _log(logger, "auto：Cloudflare 直连可达，使用直连")
-        return None, "auto→direct"
+        return None, "auto→direct", False
 
-    # 直连不通：回退环境代理（常见于容器 DNS 坏了、或需 Clash 才能访问 CF）
-    if env:
-        _log(logger, f"auto：Cloudflare 直连不可达，回退环境代理 {env.get('server')} "
-                     f"（DNS 将尽量走代理，请确认该代理能访问 challenges.cloudflare.com）")
-        return env, "auto→system"
+    if sys_proxy:
+        _log(logger, f"auto：Cloudflare 直连不可达，回退系统代理({sys_src}) {sys_proxy.get('server')}")
+        return sys_proxy, f"auto→system({sys_src})", False
 
-    _log(logger, "auto：Cloudflare 直连不可达，且无可用代理。"
-                 "Turnstile iframe 大概率无法渲染；请在插件里填能访问 Cloudflare 的代理，"
-                 "或修复容器 DNS/出站网络")
-    return None, "auto→direct(CF不可达)"
+    # 无代理：尽量用公共 DNS + DoH 修容器 DNS
+    if dns_failed:
+        _log(logger, "auto：系统 DNS 无法解析 Cloudflare，将启用公共 DNS 映射 + 浏览器 DoH")
+    else:
+        _log(logger, "auto：Cloudflare 直连 TCP 不通且无代理；仍尝试 DNS 修复后直连")
+    return None, "auto→direct+dns_fix", True
 
 
 # ============================================================
@@ -814,9 +984,11 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                   user_agent: str = "") -> List[Dict]:
     from playwright.async_api import async_playwright
 
+    _log(logger, f"======== Katabump 引擎 v{ENGINE_VERSION} 启动 ========")
+
     # 决定代理策略；浏览器侧只用 launch proxy，避免环境变量与 launch 双重代理
-    proxy_dict, strategy = resolve_browser_proxy(proxy_server, proxy_mode, logger)
-    _log(logger, f"代理策略: {strategy}")
+    proxy_dict, strategy, need_dns_fix = resolve_browser_proxy(proxy_server, proxy_mode, logger)
+    _log(logger, f"代理策略: {strategy} | DNS修复: {'开' if need_dns_fix else '关'}")
 
     # 清掉环境代理，避免 Playwright 子进程再读一层与 launch 冲突
     saved_proxy_env = {}
@@ -829,14 +1001,29 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
     exe = chrome_path.strip() or ensure_chromium(logger)
     ua = user_agent.strip() or DEFAULT_UA
     results = []
+    # 注意：不要加 --disable-background-networking，会干扰 DoH / CF 挑战资源加载
     launch_args = [
         "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}",
-        "--disable-background-networking",
         "--mute-audio", "--no-first-run", "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
         "--lang=zh-CN",
     ]
+
+    # 容器 DNS 解不了 CF 时：公共 DNS 预映射 + 浏览器 DoH
+    if need_dns_fix:
+        try:
+            rules = build_cf_host_resolver_rules(logger)
+            if rules:
+                launch_args.append(f"--host-resolver-rules={rules}")
+                _log(logger, "已注入 host-resolver-rules（公共 DNS 映射 CF 域名，修复 ERR_NAME_NOT_RESOLVED）")
+            else:
+                _log(logger, "公共 DNS 映射未生成（可能 UDP/53 出站也被拦，将仅依赖 DoH）")
+        except Exception as e:
+            _log(logger, f"生成 host-resolver-rules 失败: {e}")
+        launch_args.extend(chromium_doh_args())
+        _log(logger, "已启用浏览器 DNS-over-HTTPS（阿里/DNSPod/Cloudflare/Google）")
+
     try:
         async with async_playwright() as p:
             launch_kwargs = {

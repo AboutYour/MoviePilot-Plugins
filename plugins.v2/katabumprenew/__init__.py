@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -97,7 +97,7 @@ class KatabumpRenew(_PluginBase):
 
         # onlyonce：立即跑一次
         if self._onlyonce:
-            logger.info("Katabump 续期：立即运行一次")
+            logger.info(f"Katabump 续期 v{self.plugin_version}：立即运行一次")
             self._onlyonce = False
             self.__update_config()
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -315,12 +315,12 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "1) 日志若出现 ERR_NAME_NOT_RESOLVED / challenges.cloudflare.com 失败，是容器访问不了 Cloudflare，"
-                                            "不是账号问题：填能访问 CF 的代理，或修容器 DNS。"
-                                            "2) 代理模式默认「自动」：CF 直连可达则直连；不可达则回退 HTTP(S)_PROXY。"
-                                            "3) socks5 会自动改为 socks5h（DNS 走代理），避免容器 DNS 解不了 CF 子域。"
-                                            "4) Turnstile 还要求出口像住宅 IP；机房代理即使通了 CF 也可能不发 token。"
-                                            "5) 不要开无头模式；首次运行会自动下载 chromium。",
+                                    "text": "v1.3.0：容器 DNS 解不了 CF 时会自动用公共 DNS 映射 + 浏览器 DoH；"
+                                            "并自动读取 MoviePilot 的 PROXY_HOST。"
+                                            "1) 日志开头必须看到「引擎 v1.3.0」才算更新成功，否则请重装/重启 MP。"
+                                            "2) 代理模式默认「自动」：CF 不通则回退 PROXY_HOST / HTTP(S)_PROXY。"
+                                            "3) 仍 ERR_NAME_NOT_RESOLVED 时请填能访问 Cloudflare 的代理。"
+                                            "4) Turnstile 还要求住宅出口 IP；不要开无头模式。",
                                 },
                             }],
                         }],
@@ -444,6 +444,8 @@ class KatabumpRenew(_PluginBase):
             return
         self._running = True
         try:
+            logger.info(f"[Katabump] 插件版本 {self.plugin_version}，账号数 {len(accounts)}，"
+                        f"proxy_mode={self._proxy_mode}，proxy={'有' if self._proxy_server else '无'}")
             results = asyncio.run(self._run_all(accounts))
             self._save_history(results)
             self._notify_summary(results)

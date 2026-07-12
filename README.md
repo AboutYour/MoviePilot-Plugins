@@ -93,6 +93,18 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 
 ## 版本
 
+- **v1.3.0**：公共 DNS 预解析 + Chromium host-resolver-rules / DoH 修复 `ERR_NAME_NOT_RESOLVED`；自动读取 MoviePilot `PROXY_HOST`；启动打印引擎版本
 - **v1.2.0**：CF 连通性预检、代理 auto 回退、socks5h 远程 DNS、网络失败提前结束等待
 - **v1.1.0**：反自动化检测、直连优先、真实 Chrome 渠道
 - **v1.0.0**：初版续期流程
+
+### 如何确认已更新到最新版
+
+运行后日志开头应出现：
+
+```text
+[Katabump] 插件版本 1.3.0 ...
+[Katabump] ======== Katabump 引擎 v1.3.0 启动 ========
+```
+
+若仍看到「需住宅 IP 完成官方验证」且没有「引擎 v1.3.0」，说明容器里还是旧代码：请在插件市场**卸载重装**或重启 MoviePilot 后再试。

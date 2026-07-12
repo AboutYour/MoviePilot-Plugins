@@ -2,13 +2,14 @@
   "KatabumpRenew": {
     "name": "Katabump自动续期",
     "description": "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到 MoviePilot 通知。需在住宅网络（如家里的 NAS）运行才能通过 Cloudflare 验证。",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "level": 1,
     "author": "kbmgr",
     "authorUrl": "https://github.com/AboutYour",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png",
     "history": {
-      "v1.2.0": "Cloudflare 连通性预检 + 代理自动回退(auto) + socks5h 远程 DNS + 网络失败提前结束等待，修复容器 DNS 解不了 challenges.cloudflare.com 时空等 120s。",
+      "v1.3.0": "修复容器 DNS 解不了 challenges.cloudflare.com：公共 DNS 预解析+host-resolver-rules 映射随机子域、浏览器 DoH、读取 MoviePilot PROXY_HOST；启动日志打印引擎版本便于确认是否更新成功。",
+      "v1.2.0": "Cloudflare 连通性预检 + 代理自动回退(auto) + socks5h 远程 DNS + 网络失败提前结束等待。",
       "v1.1.0": "反自动化检测 + 默认清除环境代理直连住宅出口 + 优先真实 Chrome 渠道，修复 Turnstile token 始终为空。",
       "v1.0.0": "移植桌面版一键签到逻辑：登录过 Turnstile、See/Renew、解 ALTCHA、顺序处理多账号、每账号截图并通过 MoviePilot 通知汇总。"
     }

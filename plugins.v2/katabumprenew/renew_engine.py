@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.4"
+ENGINE_VERSION = "1.3.5"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -504,6 +504,7 @@ async def _get_turnstile_state(page) -> dict:
                 const token = vals.find(v => v.length > 20) || '';
                 const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey]'));
                 const allIframes = Array.from(document.querySelectorAll('iframe'));
+                const blankIframeCount = allIframes.filter(f => !String(f.getAttribute('src') || f.src || '').trim()).length;
                 const iframeBrief = allIframes.slice(0, 6).map((f, idx) => ({
                     idx,
                     src: String(f.getAttribute('src') || f.src || '').slice(0, 180),
@@ -527,6 +528,7 @@ async def _get_turnstile_state(page) -> dict:
                     required: els.length > 0 || containers.length > 0 || iframes.length > 0,
                     token, inputCount: els.length, iframeCount: iframes.length,
                     allIframeCount: allIframes.length,
+                    blankIframeCount,
                     containerCount: containers.length,
                     hasApi: typeof window.turnstile !== 'undefined',
                     readyState: document.readyState,
@@ -535,7 +537,53 @@ async def _get_turnstile_state(page) -> dict:
             }"""
         )
     except Exception:
-        return {"required": False, "token": "", "inputCount": 0, "iframeCount": 0, "allIframeCount": 0, "containerCount": 0, "hasApi": False, "iframeBrief": []}
+        return {"required": False, "token": "", "inputCount": 0, "iframeCount": 0, "allIframeCount": 0, "containerCount": 0, "hasApi": False, "iframeBrief": [], "blankIframeCount": 0}
+
+
+async def _rescue_blank_turnstile(page, logger) -> bool:
+    """NAS/部分 Chromium 下 Turnstile 可能留下 about:blank 空 iframe，导致后续 render 不再执行。"""
+    try:
+        changed = await page.evaluate(
+            """async () => {
+                const sleep = ms => new Promise(r => setTimeout(r, ms));
+                const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey]'));
+                if (!containers.length) return false;
+                let removed = 0;
+                for (const c of containers) {
+                    for (const f of Array.from(c.querySelectorAll('iframe'))) {
+                        const src = String(f.getAttribute('src') || f.src || '').trim();
+                        if (!src || src === 'about:blank') {
+                            f.remove();
+                            removed++;
+                        }
+                    }
+                    c.removeAttribute('data-turnstile-widget-id');
+                    delete c.dataset.__r;
+                }
+                for (let i = 0; i < 80 && typeof window.turnstile === 'undefined'; i++) await sleep(250);
+                if (typeof window.turnstile === 'undefined' || typeof window.turnstile.render !== 'function') return removed > 0;
+                for (const c of containers) {
+                    const sitekey = c.getAttribute('data-sitekey');
+                    if (!sitekey) continue;
+                    try {
+                        window.turnstile.render(c, {
+                            sitekey,
+                            callback: (t) => document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach(i => i.value = t || ''),
+                            'error-callback': () => {},
+                            'expired-callback': () => {}
+                        });
+                    } catch (e) {}
+                }
+                await sleep(2500);
+                return true;
+            }"""
+        )
+        if changed:
+            _log(logger, "检测到 Turnstile 空 iframe，已清理并尝试重新渲染（NAS/Chromium 兼容修复）")
+        return bool(changed)
+    except Exception as e:
+        _log(logger, f"Turnstile 空 iframe 修复失败: {e}")
+        return False
 
 
 async def _render_turnstile(page, logger):
@@ -656,6 +704,10 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
         _log(logger, "本次登录页未触发 Turnstile")
         return True
 
+    if st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi"):
+        await _rescue_blank_turnstile(page, logger)
+        await page.wait_for_timeout(1500)
+        st = await _get_turnstile_state(page)
     if st.get("iframeCount", 0) == 0 and st.get("containerCount", 0) > 0 and st.get("hasApi"):
         await _render_turnstile(page, logger)
         await page.wait_for_timeout(2000)
@@ -667,6 +719,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
     start = time.time()
     last_log = 0
     reloaded = False
+    blank_rescue_attempted = False
     saw_iframe = st.get("iframeCount", 0) > 0 or st.get("allIframeCount", 0) > 0
     while time.time() - start < timeout_s:
         st = await _get_turnstile_state(page)
@@ -683,6 +736,15 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                          f"请检查容器能否解析 challenges.cloudflare.com，或在插件配置代理（socks5 会自动走远程 DNS）")
             return False
 
+        if (not blank_rescue_attempted) and st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi") and waited > 8:
+            blank_rescue_attempted = True
+            await _rescue_blank_turnstile(page, logger)
+            await page.wait_for_timeout(2500)
+            st = await _get_turnstile_state(page)
+            if st.get("token"):
+                _log(logger, f"空 iframe 修复后已获得 Turnstile token（长度 {len(st['token'])}）")
+                return True
+
         if not reloaded and st.get("required") and st.get("iframeCount", 0) == 0 and st.get("allIframeCount", 0) == 0 and waited > 18:
             reloaded = True
             _log(logger, "iframe 未渲染，刷新登录页重试一次...")
@@ -698,7 +760,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
             _log(logger, f"token 仍为空，已等待 {int(waited)}s/{timeout_s}s"
                           f"（container={st.get('containerCount', 0)} iframe={st.get('iframeCount', 0)} "
                           f"all_iframe={st.get('allIframeCount', 0)} ready={st.get('readyState', '')} "
-                          f"api={st.get('hasApi')} cf_net_fail={cf_tracker.hard_fails if cf_tracker else 0}）")
+                          f"api={st.get('hasApi')} blank_iframe={st.get('blankIframeCount', 0)} cf_net_fail={cf_tracker.hard_fails if cf_tracker else 0}）")
             last_log = time.time()
         await page.wait_for_timeout(1000)
 
@@ -707,9 +769,9 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                       "challenges.cloudflare.com（DNS/出站被限制），不是单纯的 IP 信誉问题；"
                       "请检查容器/宿主机能否访问该域名，或在插件配置里填一个能正常访问 Cloudflare 的代理服务器")
     else:
-        _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 已渲染但验证服务器拒发令牌，"
-                      "通常是出口 IP 被 Cloudflare 判定为机房/云 IP；请改用住宅网络运行，"
-                      "或在插件配置的代理服务器里填一个住宅代理")
+        _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 已出现但没有拿到 token。"
+                      "在飞牛 NAS/家庭网络场景下，更常见原因是容器 DNS/IPv6/浏览器组件导致 CF 脚本被中止，"
+                      "不应直接判定为机房 IP；请先检查 NAS 的 DNS、IPv6 与容器出站，必要时再配置可访问 Cloudflare 的代理")
     return False
 
 
@@ -866,7 +928,7 @@ def _turnstile_fail_detail(cf_tracker: Optional[CfNetworkTracker]) -> str:
                 f"（{cf_tracker.last_fail_reason or 'unknown'}）；"
                 "请修复容器 DNS/出站，或在插件配置可访问 Cloudflare 的代理")
     return ("Cloudflare Turnstile 未通过"
-            "（出口 IP 未通过官方验证，或挑战页未加载；请用住宅网络/住宅代理）")
+            "（iframe 已出现但 token 为空；家庭 NAS 场景优先检查容器 DNS/IPv6/Chromium 出站，必要时再配置代理）")
 
 
 async def process_account(context, user: Dict[str, str], login_url: str, shot_dir: Path,

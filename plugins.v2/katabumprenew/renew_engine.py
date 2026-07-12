@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.3"
+ENGINE_VERSION = "1.3.4"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -502,21 +502,40 @@ async def _get_turnstile_state(page) -> dict:
                 const els = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'));
                 const vals = els.map(e => String(e.value || '').trim());
                 const token = vals.find(v => v.length > 20) || '';
-                const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+                const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey]'));
                 const allIframes = Array.from(document.querySelectorAll('iframe'));
-                const iframes = allIframes.filter(f => /turnstile|challenges\\.cloudflare/i.test([f.src||'', f.title||'', f.name||'', f.id||''].join(' ')));
+                const iframeBrief = allIframes.slice(0, 6).map((f, idx) => ({
+                    idx,
+                    src: String(f.getAttribute('src') || f.src || '').slice(0, 180),
+                    title: String(f.getAttribute('title') || '').slice(0, 80),
+                    name: String(f.getAttribute('name') || '').slice(0, 80),
+                    id: String(f.getAttribute('id') || '').slice(0, 80),
+                    parentClass: String(f.parentElement ? f.parentElement.className || '' : '').slice(0, 120),
+                    parentDataSitekey: String(f.parentElement ? f.parentElement.getAttribute('data-sitekey') || '' : '').slice(0, 60)
+                }));
+                let iframes = allIframes.filter(f => /turnstile|challenges\.cloudflare|cf-chl|cloudflare/i.test([
+                    f.src || '', f.getAttribute('src') || '', f.title || '', f.name || '', f.id || '',
+                    f.parentElement ? (f.parentElement.className || '') : '',
+                    f.parentElement ? (f.parentElement.getAttribute('data-sitekey') || '') : ''
+                ].join(' ')));
+                // 关键修复：部分 Turnstile iframe 初始为 about:blank 或无 src，无法通过 src/title 识别。
+                // 只要页面存在 cf-turnstile/data-sitekey 容器，容器附近出现的 iframe 都按挑战 iframe 处理，避免误刷新打断加载。
+                if (iframes.length === 0 && containers.length > 0 && allIframes.length > 0) {
+                    iframes = allIframes;
+                }
                 return {
                     required: els.length > 0 || containers.length > 0 || iframes.length > 0,
                     token, inputCount: els.length, iframeCount: iframes.length,
                     allIframeCount: allIframes.length,
                     containerCount: containers.length,
                     hasApi: typeof window.turnstile !== 'undefined',
-                    readyState: document.readyState
+                    readyState: document.readyState,
+                    iframeBrief
                 };
             }"""
         )
     except Exception:
-        return {"required": False, "token": "", "inputCount": 0, "iframeCount": 0, "containerCount": 0, "hasApi": False}
+        return {"required": False, "token": "", "inputCount": 0, "iframeCount": 0, "allIframeCount": 0, "containerCount": 0, "hasApi": False, "iframeBrief": []}
 
 
 async def _render_turnstile(page, logger):
@@ -625,6 +644,11 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                                cf_tracker: Optional[CfNetworkTracker] = None) -> bool:
     _log(logger, "检查 Cloudflare Turnstile token...")
     st = await _get_turnstile_state(page)
+    try:
+        if st.get("allIframeCount", 0) > 0:
+            _log(logger, f"Turnstile iframe 调试: {st.get('iframeBrief', [])}")
+    except Exception:
+        pass
     if st.get("token"):
         _log(logger, f"已有 Turnstile token（长度 {len(st['token'])}）")
         return True
@@ -643,10 +667,10 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
     start = time.time()
     last_log = 0
     reloaded = False
-    saw_iframe = st.get("iframeCount", 0) > 0
+    saw_iframe = st.get("iframeCount", 0) > 0 or st.get("allIframeCount", 0) > 0
     while time.time() - start < timeout_s:
         st = await _get_turnstile_state(page)
-        if st.get("iframeCount", 0) > 0:
+        if st.get("iframeCount", 0) > 0 or st.get("allIframeCount", 0) > 0:
             saw_iframe = True
         if st.get("token"):
             _log(logger, f"已获得 Turnstile token（长度 {len(st['token'])}）")
@@ -659,7 +683,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                          f"请检查容器能否解析 challenges.cloudflare.com，或在插件配置代理（socks5 会自动走远程 DNS）")
             return False
 
-        if not reloaded and st.get("required") and st.get("iframeCount", 0) == 0 and waited > 10:
+        if not reloaded and st.get("required") and st.get("iframeCount", 0) == 0 and st.get("allIframeCount", 0) == 0 and waited > 18:
             reloaded = True
             _log(logger, "iframe 未渲染，刷新登录页重试一次...")
             try:
@@ -870,13 +894,13 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         if "dashboard" in page.url:
             await page.goto(LOGOUT_URL)
             await page.wait_for_timeout(2000)
-        await page.goto(login_url)
-        await page.wait_for_timeout(2000)
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
         if "dashboard" in page.url and "login" not in page.url:
             await page.goto(LOGOUT_URL)
             await page.wait_for_timeout(2000)
-            await page.goto(login_url)
-            await page.wait_for_timeout(2000)
+            await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
         await page.wait_for_timeout(2000)
 
         # 2) 登录：先填表再等待 Cloudflare Turnstile。

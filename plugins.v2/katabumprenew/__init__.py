@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -315,9 +315,9 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.3.3：先填账号密码再等 Turnstile，修复部分站点表单交互后才渲染 iframe/token 的情况。"
+                                    "text": "v1.3.4：先填账号密码再等 Turnstile，修复部分站点表单交互后才渲染 iframe/token 的情况。"
                                             "同时保留 CF 随机子域 DNS 映射。"
-                                            "1) 日志须出现「引擎 v1.3.3」和「已预填账号密码」。"
+                                            "1) 日志须出现「引擎 v1.3.4」和「已预填账号密码」。"
                                             "2) 代理模式默认自动；可填 PROXY_HOST 或插件代理。"
                                             "3) Turnstile 仍需住宅出口；不要开无头模式。",
                                 },

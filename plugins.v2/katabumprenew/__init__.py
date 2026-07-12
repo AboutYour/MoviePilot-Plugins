@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.4.0.diagnostic"
+    plugin_version = "1.4.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -51,7 +51,8 @@ class KatabumpRenew(_PluginBase):
     _cron = "30 3 */3 * *"
     _login_url = "https://dashboard.katabump.com/auth/login"
     _accounts_json = ""
-    _chrome_path = ""            # 可选：手动指定 Chrome/Chromium 路径
+    _chrome_path = ""            # 可选：手动指定 Chrome/Chromium 路径或 CDP 地址
+    _browser_mode = "auto"         # auto/playwright/system_chrome/system_edge/cdp
     _turnstile_wait = 120        # 登录等待 Turnstile 令牌秒数
     _renew_attempts = 3          # 续期重试次数
     _headless = False            # Turnstile/ALTCHA 需要“有头”，默认 False（配合 xvfb）
@@ -71,6 +72,7 @@ class KatabumpRenew(_PluginBase):
         self._login_url = "https://dashboard.katabump.com/auth/login"
         self._accounts_json = ""
         self._chrome_path = ""
+        self._browser_mode = "auto"
         self._turnstile_wait = 120
         self._renew_attempts = 3
         self._headless = False
@@ -85,6 +87,8 @@ class KatabumpRenew(_PluginBase):
             self._login_url = (config.get("login_url") or self._login_url).strip()
             self._accounts_json = config.get("accounts_json") or ""
             self._chrome_path = (config.get("chrome_path") or "").strip()
+            bm = (config.get("browser_mode") or "auto").strip().lower()
+            self._browser_mode = bm if bm in ("auto", "playwright", "system_chrome", "system_edge", "cdp") else "auto"
             self._turnstile_wait = int(config.get("turnstile_wait") or 120)
             self._renew_attempts = int(config.get("renew_attempts") or 3)
             self._headless = bool(config.get("headless"))
@@ -118,6 +122,7 @@ class KatabumpRenew(_PluginBase):
             "login_url": self._login_url,
             "accounts_json": self._accounts_json,
             "chrome_path": self._chrome_path,
+            "browser_mode": self._browser_mode,
             "turnstile_wait": self._turnstile_wait,
             "renew_attempts": self._renew_attempts,
             "headless": self._headless,
@@ -280,6 +285,24 @@ class KatabumpRenew(_PluginBase):
                                 "content": [{
                                     "component": "VSelect",
                                     "props": {
+                                        "model": "browser_mode",
+                                        "label": "浏览器模式",
+                                        "items": [
+                                            {"title": "自动(推荐)", "value": "auto"},
+                                            {"title": "仅 Playwright Chromium", "value": "playwright"},
+                                            {"title": "优先系统 Chrome(channel=chrome)", "value": "system_chrome"},
+                                            {"title": "优先系统 Edge(channel=msedge)", "value": "system_edge"},
+                                            {"title": "外部 Chrome CDP", "value": "cdp"},
+                                        ],
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSelect",
+                                    "props": {
                                         "model": "proxy_mode",
                                         "label": "代理模式",
                                         "items": [
@@ -315,8 +338,8 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.4.0 Diagnostic：新增原生函数、Cloudflare 内部状态、CSP 与 A/B 无隐身脚本探针。"
-                                            "1) 日志须出现「引擎 v1.4.0 Diagnostic」。"
+                                    "text": "v1.4.1：新增浏览器模式，可优先尝试系统 Chrome/Edge，减少 Playwright Chromium 兼容问题。"
+                                            "1) 日志须出现「引擎 v1.4.1」。"
                                             "2) 若继续空 iframe，优先使用 CDP 模式而不是继续调整代理。"
                                             "3) 不建议开启无头模式。",
                                 },
@@ -333,6 +356,7 @@ class KatabumpRenew(_PluginBase):
             "login_url": "https://dashboard.katabump.com/auth/login",
             "accounts_json": "",
             "chrome_path": "",
+            "browser_mode": "auto",
             "turnstile_wait": 120,
             "renew_attempts": 3,
             "headless": False,
@@ -490,6 +514,7 @@ class KatabumpRenew(_PluginBase):
             shot_dir=self._screenshot_dir(),
             logger=logger,
             chrome_path=self._chrome_path,
+            browser_mode=self._browser_mode,
             turnstile_wait=self._turnstile_wait,
             renew_attempts=self._renew_attempts,
             headless=self._headless,

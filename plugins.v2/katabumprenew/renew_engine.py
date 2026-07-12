@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.4.0 Diagnostic"
+ENGINE_VERSION = "1.4.1"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -578,7 +578,7 @@ async def _log_turnstile_diagnostics(page, logger, label: str = "") -> None:
     """
     try:
         data = await page.evaluate(
-            """() => {
+            r"""() => {
                 const str = (v, n=180) => {
                     try { return String(v == null ? '' : v).slice(0, n); } catch(e) { return ''; }
                 };
@@ -1449,7 +1449,7 @@ async def _diagnostic_ab_probe(p, login_url: str, exe: str, launch_kwargs: dict,
 
 
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
-                  logger=None, chrome_path: str = "", turnstile_wait: int = 120,
+                  logger=None, chrome_path: str = "", browser_mode: str = "auto", turnstile_wait: int = 120,
                   renew_attempts: int = 3, headless: bool = False,
                   proxy_server: str = "", proxy_mode: str = "auto",
                   user_agent: str = "") -> List[Dict]:
@@ -1469,10 +1469,18 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
     if saved_proxy_env:
         _log(logger, f"已临时清除环境代理变量（改由 Playwright proxy 注入）: {list(saved_proxy_env.keys())}")
 
+    browser_mode = (browser_mode or "auto").strip().lower()
+    if browser_mode not in ("auto", "playwright", "system_chrome", "system_edge", "cdp"):
+        browser_mode = "auto"
     chrome_target = (chrome_path or "").strip()
-    cdp_endpoint = chrome_target if is_cdp_endpoint(chrome_target) else ""
-    exe = "" if cdp_endpoint else (chrome_target or ensure_chromium(logger))
+    cdp_endpoint = chrome_target if (browser_mode == "cdp" or is_cdp_endpoint(chrome_target)) else ""
+    exe = ""
+    if not cdp_endpoint and chrome_target:
+        exe = chrome_target
+    elif not cdp_endpoint and browser_mode in ("auto", "playwright"):
+        exe = ensure_chromium(logger) or ""
     ua = user_agent.strip() or DEFAULT_UA
+    _log(logger, f"浏览器模式: {browser_mode} | chrome_path/CDP: {'已填写' if chrome_target else '未填写'}")
     results = []
     # 注意：不要加 --disable-background-networking，会干扰 DoH / CF 挑战资源加载
     launch_args = [
@@ -1511,7 +1519,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式 v1.4.0 Diagnostic：增加原生函数/CF状态/A-B无隐身脚本探针")
+        _log(logger, f"NAS 兼容模式 v{ENGINE_VERSION}：支持浏览器模式 browser_mode={browser_mode or 'auto'}，保留原生函数/CF状态诊断")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 
@@ -1535,20 +1543,36 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                     browser = await p.chromium.connect_over_cdp(cdp_endpoint, timeout=30000)
                     _log(logger, f"使用外部 Chrome/CDP: {cdp_endpoint}")
                 except Exception as e:
-                    _log(logger, f"外部 Chrome/CDP 连接失败({e})，回退容器内 Chromium")
+                    _log(logger, f"外部 Chrome/CDP 连接失败({e})，按浏览器模式回退")
+                    if browser_mode == "cdp":
+                        raise
+            if browser is None and browser_mode == "system_chrome":
+                try:
+                    browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+                    _log(logger, "使用系统 Chrome 渠道(channel=chrome)")
+                except Exception as e:
+                    _log(logger, f"系统 Chrome 渠道启动失败({e})，回退指定/内置 Chromium")
+            if browser is None and browser_mode == "system_edge":
+                try:
+                    browser = await p.chromium.launch(channel="msedge", **launch_kwargs)
+                    _log(logger, "使用系统 Edge 渠道(channel=msedge)")
+                except Exception as e:
+                    _log(logger, f"系统 Edge 渠道启动失败({e})，回退指定/内置 Chromium")
             if browser is None and exe:
                 try:
                     browser = await p.chromium.launch(executable_path=exe, **launch_kwargs)
                     _log(logger, f"使用浏览器: {exe}")
                 except Exception as e:
-                    _log(logger, f"指定浏览器启动失败({e})，尝试其它方式")
-            if browser is None:
+                    _log(logger, f"指定/缓存浏览器启动失败({e})，尝试其它方式")
+            if browser is None and browser_mode == "auto":
                 try:
                     browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
-                    _log(logger, "使用系统 Chrome 渠道")
-                except Exception:
-                    browser = await p.chromium.launch(**launch_kwargs)
-                    _log(logger, "使用 Playwright 内置 chromium")
+                    _log(logger, "使用系统 Chrome 渠道(channel=chrome)")
+                except Exception as e:
+                    _log(logger, f"系统 Chrome 渠道不可用({e})，回退 Playwright 内置 chromium")
+            if browser is None:
+                browser = await p.chromium.launch(**launch_kwargs)
+                _log(logger, "使用 Playwright 内置 chromium")
 
             context = await browser.new_context(
                 viewport=VIEWPORT,

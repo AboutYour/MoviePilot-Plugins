@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -55,6 +55,7 @@ class KatabumpRenew(_PluginBase):
     _turnstile_wait = 120        # 登录等待 Turnstile 令牌秒数
     _renew_attempts = 3          # 续期重试次数
     _headless = False            # Turnstile/ALTCHA 需要“有头”，默认 False（配合 xvfb）
+    _proxy_server = ""           # 可选：代理服务器（非住宅网络运行时，用住宅代理过 Turnstile）
 
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
@@ -71,6 +72,7 @@ class KatabumpRenew(_PluginBase):
         self._turnstile_wait = 120
         self._renew_attempts = 3
         self._headless = False
+        self._proxy_server = ""
 
         if config:
             self._enabled = bool(config.get("enabled"))
@@ -83,6 +85,7 @@ class KatabumpRenew(_PluginBase):
             self._turnstile_wait = int(config.get("turnstile_wait") or 120)
             self._renew_attempts = int(config.get("renew_attempts") or 3)
             self._headless = bool(config.get("headless"))
+            self._proxy_server = (config.get("proxy_server") or "").strip()
 
         # 停掉旧调度
         self.stop_service()
@@ -113,6 +116,7 @@ class KatabumpRenew(_PluginBase):
             "turnstile_wait": self._turnstile_wait,
             "renew_attempts": self._renew_attempts,
             "headless": self._headless,
+            "proxy_server": self._proxy_server,
         })
 
     def get_state(self) -> bool:
@@ -254,13 +258,25 @@ class KatabumpRenew(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
                                         "model": "chrome_path",
                                         "label": "Chrome 路径(可选，留空自动)",
                                         "placeholder": "留空则自动使用容器内 chromium / 首次自动安装",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "proxy_server",
+                                        "label": "代理服务器(可选，非住宅网络时用于过 Cloudflare)",
+                                        "placeholder": "http://user:pass@host:port 或 socks5://host:port",
                                     },
                                 }],
                             },
@@ -276,8 +292,10 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "需在住宅网络（如家里的 NAS）运行才能通过 Cloudflare 验证；机房/云 IP 会验证失败。"
-                                            "首次运行会自动下载 chromium（约 150MB，仅一次）。",
+                                    "text": "1) 必须用住宅出口（家里 NAS 直连即可）。Clash/机房代理通常过不了 Turnstile，"
+                                            "插件默认不走系统代理，除非你在上方单独填「住宅代理」。"
+                                            "2) 不要开「无头模式」。3) 首次运行会自动下载 chromium。"
+                                            "4) 桌面版能过、插件过不了，多半是浏览器自动化指纹；v1.1.0 已加反检测。",
                                 },
                             }],
                         }],
@@ -295,6 +313,7 @@ class KatabumpRenew(_PluginBase):
             "turnstile_wait": 120,
             "renew_attempts": 3,
             "headless": False,
+            "proxy_server": "",
         }
 
     def get_page(self) -> List[dict]:
@@ -448,4 +467,5 @@ class KatabumpRenew(_PluginBase):
             turnstile_wait=self._turnstile_wait,
             renew_attempts=self._renew_attempts,
             headless=self._headless,
+            proxy_server=self._proxy_server,
         )

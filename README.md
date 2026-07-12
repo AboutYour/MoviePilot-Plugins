@@ -50,9 +50,11 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
 | 续期重试次数 | Renew/ALTCHA 失败重试，默认 3 |
 | 无头模式 | 默认关闭。Turnstile/ALTCHA 需要“有头”环境，容器里配合 xvfb |
 | Chrome 路径(可选) | 留空自动用容器内 chromium；也可指定宿主挂进来的 Chrome |
+| 代理服务器(可选) | `http://user:pass@host:port` 或 `socks5://host:port`。MoviePilot 跑在云端/机房时，填一个住宅代理可绕开 Turnstile 的 IP 限制 |
 
 ## 注意
 
-- 必须住宅网络运行，否则登录会卡在 Turnstile。
+- Cloudflare Turnstile 只认住宅出口 IP；机房/云 IP 直连会一直卡在日志里的 `token 仍为空...需住宅 IP 完成官方验证`，最终以 `Cloudflare Turnstile 未通过` 失败收场（这是预期行为，不是插件报错）。
+- 两种解法：① 把 MoviePilot（或至少本插件的运行环境）放在家里的 NAS/住宅网络；② 在插件配置的**代理服务器**里填一个住宅代理，让 Playwright 走代理出口。
 - 首次运行下载 chromium 稍慢，属正常。
 - 截图保存在插件数据目录 `screenshots/` 下，历史记录可在插件详情页查看。

@@ -147,8 +147,11 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120) -> bool:
     start = time.time()
     last_log = 0
     reloaded = False
+    saw_iframe = st.get("iframeCount", 0) > 0
     while time.time() - start < timeout_s:
         st = await _get_turnstile_state(page)
+        if st.get("iframeCount", 0) > 0:
+            saw_iframe = True
         if st.get("token"):
             _log(logger, f"已获得 Turnstile token（长度 {len(st['token'])}）")
             return True
@@ -162,10 +165,20 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120) -> bool:
             continue
         if time.time() - last_log > 15:
             waited = int(time.time() - start)
-            _log(logger, f"token 仍为空，已等待 {waited}s/{timeout_s}s（需住宅 IP 完成官方验证）")
+            _log(logger, f"token 仍为空，已等待 {waited}s/{timeout_s}s"
+                          f"（container={st.get('containerCount', 0)} iframe={st.get('iframeCount', 0)} "
+                          f"api={st.get('hasApi')}，需住宅 IP 完成官方验证）")
             last_log = time.time()
         await page.wait_for_timeout(1000)
-    _log(logger, "❌ Turnstile token 超时仍为空")
+
+    if not saw_iframe:
+        _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 全程未渲染出来，大概率是当前网络访问不了 "
+                      "challenges.cloudflare.com（DNS/出站被限制），不是单纯的 IP 信誉问题；"
+                      "请检查容器/宿主机能否访问该域名，或在插件配置里填一个能正常访问 Cloudflare 的代理服务器")
+    else:
+        _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 已渲染但验证服务器拒发令牌，"
+                      "通常是出口 IP 被 Cloudflare 判定为机房/云 IP；请改用住宅网络运行，"
+                      "或在插件配置的代理服务器里填一个住宅代理")
     return False
 
 
@@ -330,6 +343,18 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
     except Exception:
         pass
 
+    # 直接监听网络失败：如果连 Cloudflare 挑战/资源域名都请求失败，
+    # 说明是网络可达性问题（DNS/出站被限制），而不是 IP 信誉判定，
+    # 这类日志比单纯"token 仍为空"更能定位根因。
+    def _on_request_failed(req):
+        try:
+            url = req.url
+            if re.search(r"cloudflare|turnstile|challenges\.cloudflare\.com", url, re.I):
+                _log(logger, f"⚠️ 网络请求失败: {url}（原因: {req.failure}）—— 若持续出现，说明当前网络访问不了 Cloudflare 挑战服务，需检查出站网络或配置代理")
+        except Exception:
+            pass
+    page.on("requestfailed", _on_request_failed)
+
     try:
         # 1) 先登出，隔离上个账号会话
         if "dashboard" in page.url:
@@ -344,8 +369,13 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
             await page.wait_for_timeout(2000)
         await page.wait_for_timeout(2000)
 
-        # 2) 登录：等 Turnstile
-        await wait_turnstile_token(page, logger, turnstile_wait)
+        # 2) 登录：等待 Cloudflare Turnstile 首次令牌就绪（结果必须判断，否则超时后
+        #    仍会往下走，且下面还会再等一次满额超时，白白卡住 2 倍时长）
+        ok = await wait_turnstile_token(page, logger, turnstile_wait)
+        if not ok:
+            result["detail"] = "Cloudflare Turnstile 未通过（当前出口 IP 无法通过官方验证，请改用住宅网络运行，或在插件配置中填写代理服务器）"
+            result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
+            return result
 
         _log(logger, "填写账号密码...")
         email = page.locator('#email, input[name="email"], input[type="email"]').first
@@ -357,9 +387,10 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         await pwd.fill("")
         await pwd.fill(user["password"])
 
-        ok = await wait_turnstile_token(page, logger, turnstile_wait)
+        # 填表可能触发页面刷新/重新校验，做一次短复检（≤20s），不再重复整段超时等待
+        ok = await wait_turnstile_token(page, logger, min(20, turnstile_wait))
         if not ok:
-            result["detail"] = "Cloudflare Turnstile 未通过（需住宅 IP）"
+            result["detail"] = "Cloudflare Turnstile 未通过（当前出口 IP 无法通过官方验证，请改用住宅网络运行，或在插件配置中填写代理服务器）"
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
             return result
 
@@ -502,35 +533,130 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
     return result
 
 
+# 反自动化检测脚本：Playwright 启动的 chromium 默认带 navigator.webdriver=true 等自动化痕迹，
+# Cloudflare Turnstile 一旦识别到就拒绝发令牌（这就是桌面版 WebView2 能过、裸 Playwright 过不了的根本原因）。
+# 下面这段在每个文档创建前注入，抹掉最常见的自动化指纹，尽量贴近真实浏览器。
+STEALTH_SCRIPT = r"""
+(() => {
+  try {
+    // 1) navigator.webdriver -> undefined
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // 2) 伪造 plugins / mimeTypes 非空
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    // 3) languages
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+    // 4) window.chrome 存在（无头/自动化下常缺失）
+    if (!window.chrome) { window.chrome = { runtime: {} }; }
+    // 5) permissions.query 对 notifications 返回 default（自动化下常报 denied）
+    const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (origQuery) {
+      window.navigator.permissions.query = (params) => (
+        params && params.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(params)
+      );
+    }
+    // 6) WebGL vendor/renderer 伪装成常见显卡
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (p) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return getParam.call(this, p);
+    };
+  } catch (e) {}
+})();
+"""
+
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
                   logger=None, chrome_path: str = "", turnstile_wait: int = 120,
-                  renew_attempts: int = 3, headless: bool = False) -> List[Dict]:
+                  renew_attempts: int = 3, headless: bool = False,
+                  proxy_server: str = "", user_agent: str = "") -> List[Dict]:
     from playwright.async_api import async_playwright
 
+    # 关键：除非用户明确配置了 proxy_server，否则清掉环境变量里的代理。
+    # MoviePilot/Clash 常在环境中带 HTTP_PROXY，会把浏览器出口拐到机房 IP，
+    # 导致 Turnstile 永远不发令牌（和桌面版直连住宅 IP 行为不一致）。
+    saved_proxy_env = {}
+    proxy_env_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+    if not proxy_server.strip():
+        for k in proxy_env_keys:
+            if k in os.environ:
+                saved_proxy_env[k] = os.environ.pop(k)
+        if saved_proxy_env:
+            _log(logger, f"已临时清除环境代理，浏览器直连住宅出口: {list(saved_proxy_env.keys())}")
+    else:
+        _log(logger, f"使用用户配置的代理: {proxy_server.strip()}")
+
     exe = chrome_path.strip() or ensure_chromium(logger)
+    ua = user_agent.strip() or DEFAULT_UA
     results = []
+    # 关键：--disable-blink-features=AutomationControlled 关掉自动化标志；
+    # 配合 ignore_default_args 去掉 --enable-automation，避免暴露为自动化会话。
     launch_args = [
         "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}",
-        "--disable-extensions", "--disable-background-networking",
+        "--disable-background-networking",
         "--mute-audio", "--no-first-run", "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+        "--lang=zh-CN",
     ]
-    async with async_playwright() as p:
-        launch_kwargs = {"headless": headless, "args": launch_args}
-        if exe:
-            launch_kwargs["executable_path"] = exe
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(viewport=VIEWPORT)
-        try:
-            for i, user in enumerate(accounts):
-                _log(logger, f"=== 处理账号 {i+1}/{len(accounts)}: {user['username']} ===")
-                res = await process_account(context, user, login_url or LOGIN_URL_DEFAULT,
-                                            shot_dir, logger, turnstile_wait, renew_attempts)
-                results.append(res)
-        finally:
+    try:
+        async with async_playwright() as p:
+            launch_kwargs = {
+                "headless": headless,
+                "args": launch_args,
+                "ignore_default_args": ["--enable-automation"],
+            }
+            if proxy_server.strip():
+                launch_kwargs["proxy"] = {"server": proxy_server.strip()}
+            # 优先用真实 Chrome 渠道（指纹比 bundled chromium 更真实，更容易过 Turnstile）；
+            # 指定了 executable_path 时用它，否则尝试 channel="chrome"，都失败再退回 bundled chromium。
+            browser = None
+            if exe:
+                try:
+                    browser = await p.chromium.launch(executable_path=exe, **launch_kwargs)
+                    _log(logger, f"使用浏览器: {exe}")
+                except Exception as e:
+                    _log(logger, f"指定浏览器启动失败({e})，尝试其它方式")
+            if browser is None:
+                try:
+                    browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+                    _log(logger, "使用系统 Chrome 渠道")
+                except Exception:
+                    browser = await p.chromium.launch(**launch_kwargs)
+                    _log(logger, "使用 Playwright 内置 chromium")
+
+            context = await browser.new_context(
+                viewport=VIEWPORT,
+                user_agent=ua,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                color_scheme="light",
+                has_touch=False,
+                java_script_enabled=True,
+                extra_http_headers={
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+            )
+            await context.add_init_script(STEALTH_SCRIPT)
             try:
-                await context.close()
-                await browser.close()
-            except Exception:
-                pass
+                for i, user in enumerate(accounts):
+                    _log(logger, f"=== 处理账号 {i+1}/{len(accounts)}: {user['username']} ===")
+                    res = await process_account(context, user, login_url or LOGIN_URL_DEFAULT,
+                                                shot_dir, logger, turnstile_wait, renew_attempts)
+                    results.append(res)
+            finally:
+                try:
+                    await context.close()
+                    await browser.close()
+                except Exception:
+                    pass
+    finally:
+        # 还原环境代理
+        for k, v in saved_proxy_env.items():
+            os.environ[k] = v
     return results

@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -315,12 +315,11 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.3.0：容器 DNS 解不了 CF 时会自动用公共 DNS 映射 + 浏览器 DoH；"
-                                            "并自动读取 MoviePilot 的 PROXY_HOST。"
-                                            "1) 日志开头必须看到「引擎 v1.3.0」才算更新成功，否则请重装/重启 MP。"
-                                            "2) 代理模式默认「自动」：CF 不通则回退 PROXY_HOST / HTTP(S)_PROXY。"
-                                            "3) 仍 ERR_NAME_NOT_RESOLVED 时请填能访问 Cloudflare 的代理。"
-                                            "4) Turnstile 还要求住宅出口 IP；不要开无头模式。",
+                                    "text": "v1.3.1：修复「主域 challenges 能通、随机子域 brunhild 解不了」时误关 DNS 映射。"
+                                            "直连会强制 MAP *.challenges.cloudflare.com。"
+                                            "1) 日志须出现「引擎 v1.3.1」和「host-resolver-rules」。"
+                                            "2) 代理模式默认自动；可填 PROXY_HOST 或插件代理。"
+                                            "3) Turnstile 仍需住宅出口；不要开无头模式。",
                                 },
                             }],
                         }],

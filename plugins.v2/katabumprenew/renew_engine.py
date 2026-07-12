@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.0"
+ENGINE_VERSION = "1.3.1"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -144,6 +144,19 @@ def _dns_query_a(hostname: str, dns_server: str, timeout: float = 3.0) -> List[s
     return ips
 
 
+def resolve_a_system(hostname: str) -> Optional[str]:
+    """系统 resolver 解析，返回第一个 IPv4。"""
+    try:
+        infos = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+        for fam, _t, _p, _c, sockaddr in infos:
+            ip = sockaddr[0]
+            if fam == socket.AF_INET and ip:
+                return ip
+    except Exception:
+        pass
+    return None
+
+
 def resolve_a_public(hostname: str, logger=None) -> Optional[str]:
     """用多个公共 DNS 解析主机名，返回第一个 A 记录。"""
     for server in PUBLIC_DNS_SERVERS:
@@ -156,25 +169,70 @@ def resolve_a_public(hostname: str, logger=None) -> Optional[str]:
     return None
 
 
+def resolve_a_any(hostname: str, logger=None) -> Optional[str]:
+    """优先系统 DNS，失败再公共 DNS。"""
+    ip = resolve_a_system(hostname)
+    if ip:
+        _log(logger, f"系统 DNS 解析 {hostname} -> {ip}")
+        return ip
+    return resolve_a_public(hostname, logger)
+
+
+def system_dns_ok(hostname: str) -> bool:
+    return resolve_a_system(hostname) is not None
+
+
+def probe_cf_challenge_subdomain_dns(logger=None) -> bool:
+    """
+    Turnstile 会请求随机子域，如 brunhild.challenges.cloudflare.com。
+    主域 challenges.cloudflare.com 能解析 ≠ 这些子域能解析。
+    返回 True 表示系统 DNS 能解析「挑战类」子域（抽查若干常见/探测名）。
+    """
+    samples = [
+        "brunhild.challenges.cloudflare.com",
+        "challenges.cloudflare.com",
+    ]
+    # 再加一个探测名：若存在通配记录应能解；无通配则与 brunhild 一起视为需映射
+    probe = f"kbm{random.randint(10000, 99999)}.challenges.cloudflare.com"
+    samples.append(probe)
+
+    parent_ok = system_dns_ok("challenges.cloudflare.com")
+    results = []
+    any_sub_ok = False
+    for h in samples:
+        ok = system_dns_ok(h)
+        results.append(f"{h.split('.')[0]}={'ok' if ok else 'fail'}")
+        if ok and h != "challenges.cloudflare.com":
+            any_sub_ok = True
+    _log(logger, f"CF 子域 DNS 探测: parent={'ok' if parent_ok else 'fail'}; " + "; ".join(results))
+    # 主域通但所有抽查子域都 fail → 典型坏 DNS（用户日志场景）
+    if parent_ok and not any_sub_ok:
+        return False
+    # 主域都 fail
+    if not parent_ok:
+        return False
+    return True
+
+
 def build_cf_host_resolver_rules(logger=None) -> str:
     """
     生成 Chromium --host-resolver-rules。
-    把 challenges.cloudflare.com 及其通配子域映射到公共 DNS 解析出的 IP，
-    绕过容器内 ERR_NAME_NOT_RESOLVED。
+    把 challenges.cloudflare.com 及其通配子域映射到同一 anycast IP，
+    修复 brunhild.challenges.cloudflare.com 等随机子域 ERR_NAME_NOT_RESOLVED。
     """
     rules: List[str] = []
-    main_ip = resolve_a_public("challenges.cloudflare.com", logger)
+    main_ip = resolve_a_any("challenges.cloudflare.com", logger)
     if main_ip:
         rules.append(f"MAP challenges.cloudflare.com {main_ip}")
-        # Turnstile 会请求 brunhild.challenges.cloudflare.com 等随机子域
+        # 关键：通配映射随机挑战子域
         rules.append(f"MAP *.challenges.cloudflare.com {main_ip}")
+        _log(logger, f"将 *.challenges.cloudflare.com 全部映射到 {main_ip}")
     for host in CF_MAP_HOSTS:
         if host == "challenges.cloudflare.com":
             continue
-        ip = resolve_a_public(host, logger)
+        ip = resolve_a_any(host, logger)
         if ip:
             rules.append(f"MAP {host} {ip}")
-    # 排除本地
     if rules:
         rules.append("EXCLUDE localhost")
         rules.append("EXCLUDE 127.0.0.1")
@@ -362,15 +420,23 @@ def resolve_browser_proxy(
         return cfg, "auto→custom", False
 
     tcp_ok, dns_failed = probe_cloudflare(logger)
+    # 主域通 ≠ 随机子域通（Turnstile 用 brunhild.challenges.cloudflare.com）
+    sub_dns_ok = probe_cf_challenge_subdomain_dns(logger)
+
     if tcp_ok:
         if sys_proxy:
-            _log(logger, "auto：Cloudflare 直连可达，忽略系统代理，走本机出口")
+            _log(logger, "auto：Cloudflare 主域直连可达，忽略系统代理，走本机出口")
         else:
-            _log(logger, "auto：Cloudflare 直连可达，使用直连")
+            _log(logger, "auto：Cloudflare 主域直连可达，使用直连")
+        # 子域 DNS 坏时必须开 MAP，否则浏览器会 ERR_NAME_NOT_RESOLVED
+        if not sub_dns_ok:
+            _log(logger, "auto：主域可达但挑战子域 DNS 异常 → 启用 *.challenges.cloudflare.com 映射")
+            return None, "auto→direct+cf_subdomain_map", True
         return None, "auto→direct", False
 
     if sys_proxy:
         _log(logger, f"auto：Cloudflare 直连不可达，回退系统代理({sys_src}) {sys_proxy.get('server')}")
+        # HTTP 代理通常由代理侧解析 DNS；仍建议 socks5h。子域映射在直连路径更关键。
         return sys_proxy, f"auto→system({sys_src})", False
 
     # 无代理：尽量用公共 DNS + DoH 修容器 DNS
@@ -1010,19 +1076,23 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
         "--lang=zh-CN",
     ]
 
-    # 容器 DNS 解不了 CF 时：公共 DNS 预映射 + 浏览器 DoH
-    if need_dns_fix:
+    # 直连时：主域通但子域不通很常见，默认只要 need_dns_fix 或无代理就注入 CF 映射
+    # （有代理且为 socks5h/http 时 DNS 多在代理侧完成，可不映射）
+    apply_dns_fix = need_dns_fix or (proxy_dict is None)
+    if apply_dns_fix:
         try:
             rules = build_cf_host_resolver_rules(logger)
             if rules:
                 launch_args.append(f"--host-resolver-rules={rules}")
-                _log(logger, "已注入 host-resolver-rules（公共 DNS 映射 CF 域名，修复 ERR_NAME_NOT_RESOLVED）")
+                _log(logger, "已注入 host-resolver-rules（映射 challenges.cloudflare.com 及 *. 子域）")
             else:
-                _log(logger, "公共 DNS 映射未生成（可能 UDP/53 出站也被拦，将仅依赖 DoH）")
+                _log(logger, "CF host-resolver-rules 未生成（系统+公共 DNS 均失败，将仅依赖 DoH）")
         except Exception as e:
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用浏览器 DNS-over-HTTPS（阿里/DNSPod/Cloudflare/Google）")
+    else:
+        _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 
     try:
         async with async_playwright() as p:

@@ -93,18 +93,19 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 
 ## 版本
 
-- **v1.3.0**：公共 DNS 预解析 + Chromium host-resolver-rules / DoH 修复 `ERR_NAME_NOT_RESOLVED`；自动读取 MoviePilot `PROXY_HOST`；启动打印引擎版本
-- **v1.2.0**：CF 连通性预检、代理 auto 回退、socks5h 远程 DNS、网络失败提前结束等待
+- **v1.3.1**：修复主域通、随机子域（brunhild.*）不通时误关 DNS 映射；直连强制 `MAP *.challenges.cloudflare.com`
+- **v1.3.0**：公共 DNS 预解析 + host-resolver-rules / DoH；读取 `PROXY_HOST`；启动打印引擎版本
+- **v1.2.0**：CF 连通性预检、代理 auto 回退、socks5h、网络失败提前结束
 - **v1.1.0**：反自动化检测、直连优先、真实 Chrome 渠道
 - **v1.0.0**：初版续期流程
 
 ### 如何确认已更新到最新版
 
-运行后日志开头应出现：
-
 ```text
-[Katabump] 插件版本 1.3.0 ...
-[Katabump] ======== Katabump 引擎 v1.3.0 启动 ========
+[Katabump] 插件版本 1.3.1 ...
+[Katabump] ======== Katabump 引擎 v1.3.1 启动 ========
+[Katabump] 将 *.challenges.cloudflare.com 全部映射到 104.x.x.x
+[Katabump] 已注入 host-resolver-rules ...
 ```
 
-若仍看到「需住宅 IP 完成官方验证」且没有「引擎 v1.3.0」，说明容器里还是旧代码：请在插件市场**卸载重装**或重启 MoviePilot 后再试。
+没有 `v1.3.1` / `host-resolver-rules` 说明未更新成功：卸载重装插件并重启 MoviePilot。

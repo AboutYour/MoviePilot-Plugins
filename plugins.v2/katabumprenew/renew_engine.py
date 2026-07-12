@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.5"
+ENGINE_VERSION = "1.3.6"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -214,19 +214,25 @@ def probe_cf_challenge_subdomain_dns(logger=None) -> bool:
     return True
 
 
-def build_cf_host_resolver_rules(logger=None) -> str:
+def build_cf_host_resolver_rules(logger=None, wildcard: bool = False) -> str:
     """
     生成 Chromium --host-resolver-rules。
-    把 challenges.cloudflare.com 及其通配子域映射到同一 anycast IP，
-    修复 brunhild.challenges.cloudflare.com 等随机子域 ERR_NAME_NOT_RESOLVED。
+
+    v1.3.6 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
+    说明出口没有问题；强行把 *.challenges.cloudflare.com 映射到主域 IP
+    可能让 Cloudflare 动态挑战资源出现 net::ERR_ABORTED / 空 iframe。
+    因此默认只映射稳定主机，随机挑战子域优先交给 Chromium DoH 解析。
+    只有环境变量 KATABUMP_CF_WILDCARD_MAP=1 时才启用通配映射。
     """
     rules: List[str] = []
     main_ip = resolve_a_any("challenges.cloudflare.com", logger)
     if main_ip:
         rules.append(f"MAP challenges.cloudflare.com {main_ip}")
-        # 关键：通配映射随机挑战子域
-        rules.append(f"MAP *.challenges.cloudflare.com {main_ip}")
-        _log(logger, f"将 *.challenges.cloudflare.com 全部映射到 {main_ip}")
+        if wildcard:
+            rules.append(f"MAP *.challenges.cloudflare.com {main_ip}")
+            _log(logger, f"将 *.challenges.cloudflare.com 全部映射到 {main_ip}（强制通配模式）")
+        else:
+            _log(logger, "不再强制映射 *.challenges.cloudflare.com，随机挑战子域交给浏览器 DoH 解析")
     for host in CF_MAP_HOSTS:
         if host == "challenges.cloudflare.com":
             continue
@@ -242,9 +248,13 @@ def build_cf_host_resolver_rules(logger=None) -> str:
 def chromium_doh_args() -> List[str]:
     """启用浏览器 DNS-over-HTTPS，系统 resolv 失败时仍可解析。"""
     templates = " ".join(DOH_TEMPLATES)
+    # automatic 比 secure 更接近普通 Chrome：DoH 可用时使用，不可用时回退系统 DNS。
+    # secure 在部分 NAS/容器网络中会导致挑战子资源被 Chromium 直接 abort。
     return [
-        "--dns-over-https-mode=secure",
+        "--enable-features=DnsOverHttps",
+        "--dns-over-https-mode=automatic",
         f"--dns-over-https-templates={templates}",
+        "--disable-features=AsyncDns",
     ]
 
 
@@ -514,7 +524,7 @@ async def _get_turnstile_state(page) -> dict:
                     parentClass: String(f.parentElement ? f.parentElement.className || '' : '').slice(0, 120),
                     parentDataSitekey: String(f.parentElement ? f.parentElement.getAttribute('data-sitekey') || '' : '').slice(0, 60)
                 }));
-                let iframes = allIframes.filter(f => /turnstile|challenges\.cloudflare|cf-chl|cloudflare/i.test([
+                let iframes = allIframes.filter(f => /turnstile|challenges\\.cloudflare|cf-chl|cloudflare/i.test([
                     f.src || '', f.getAttribute('src') || '', f.title || '', f.name || '', f.id || '',
                     f.parentElement ? (f.parentElement.className || '') : '',
                     f.parentElement ? (f.parentElement.getAttribute('data-sitekey') || '') : ''
@@ -770,8 +780,8 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                       "请检查容器/宿主机能否访问该域名，或在插件配置里填一个能正常访问 Cloudflare 的代理服务器")
     else:
         _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 已出现但没有拿到 token。"
-                      "在飞牛 NAS/家庭网络场景下，更常见原因是容器 DNS/IPv6/浏览器组件导致 CF 脚本被中止，"
-                      "不应直接判定为机房 IP；请先检查 NAS 的 DNS、IPv6 与容器出站，必要时再配置可访问 Cloudflare 的代理")
+                      "在飞牛 NAS/家庭网络场景下，更常见原因是 MoviePilot 容器内 Chromium 与宿主机 Chrome 的 DNS/IPv6/浏览器组件差异，"
+                      "不应直接判定为机房 IP；若宿主机 Chrome 可登录，请优先检查容器 DNS、IPv6、网络模式与 Chromium 依赖")
     return False
 
 
@@ -1187,6 +1197,9 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
         "--mute-audio", "--no-first-run", "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
         "--lang=zh-CN",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--disable-ipv6",
+        "--enable-webgl",
     ]
 
     # 直连时：主域通但子域不通很常见，默认只要 need_dns_fix 或无代理就注入 CF 映射
@@ -1194,16 +1207,21 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
     apply_dns_fix = need_dns_fix or (proxy_dict is None)
     if apply_dns_fix:
         try:
-            rules = build_cf_host_resolver_rules(logger)
+            wildcard_map = (os.environ.get("KATABUMP_CF_WILDCARD_MAP") or "").strip().lower() in ("1", "true", "yes", "on")
+            rules = build_cf_host_resolver_rules(logger, wildcard=wildcard_map)
             if rules:
                 launch_args.append(f"--host-resolver-rules={rules}")
-                _log(logger, "已注入 host-resolver-rules（映射 challenges.cloudflare.com 及 *. 子域）")
+                if wildcard_map:
+                    _log(logger, "已注入 host-resolver-rules（含 *.challenges.cloudflare.com 强制映射）")
+                else:
+                    _log(logger, "已注入 host-resolver-rules（仅稳定 CF 主机；随机挑战子域走 DoH）")
             else:
                 _log(logger, "CF host-resolver-rules 未生成（系统+公共 DNS 均失败，将仅依赖 DoH）")
         except Exception as e:
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
-        _log(logger, "已启用浏览器 DNS-over-HTTPS（阿里/DNSPod/Cloudflare/Google）")
+        _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
+        _log(logger, "NAS 兼容模式：禁用 IPv6，随机 CF 挑战子域不做通配 IP 固定")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 

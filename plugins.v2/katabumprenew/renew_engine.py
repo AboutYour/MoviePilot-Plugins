@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.6"
+ENGINE_VERSION = "1.3.7"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -218,7 +218,7 @@ def build_cf_host_resolver_rules(logger=None, wildcard: bool = False) -> str:
     """
     生成 Chromium --host-resolver-rules。
 
-    v1.3.6 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
+    v1.3.7 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
     说明出口没有问题；强行把 *.challenges.cloudflare.com 映射到主域 IP
     可能让 Cloudflare 动态挑战资源出现 net::ERR_ABORTED / 空 iframe。
     因此默认只映射稳定主机，随机挑战子域优先交给 Chromium DoH 解析。
@@ -255,6 +255,25 @@ def chromium_doh_args() -> List[str]:
         "--dns-over-https-mode=automatic",
         f"--dns-over-https-templates={templates}",
         "--disable-features=AsyncDns",
+    ]
+
+
+def nas_chromium_runtime_args() -> List[str]:
+    """飞牛 NAS / Docker 内 Playwright Chromium 的 Turnstile 兼容参数。
+
+    宿主机 Chrome 能登录但容器内 Chromium 出现 /turnstile/.../crashed_retry +
+    net::ERR_ABORTED 时，常见不是账号或家庭出口问题，而是 headless Chromium 的
+    WebGL/SwiftShader/沙箱/共享内存运行环境导致 Turnstile 小组件崩溃。
+    """
+    return [
+        "--use-angle=swiftshader",
+        "--use-gl=swiftshader",
+        "--ignore-gpu-blocklist",
+        "--enable-unsafe-swiftshader",
+        "--disable-software-rasterizer",
+        "--disable-features=site-per-process,IsolateOrigins,VizDisplayCompositor",
+        "--disable-site-isolation-trials",
+        "--font-render-hinting=none",
     ]
 
 
@@ -551,7 +570,25 @@ async def _get_turnstile_state(page) -> dict:
 
 
 async def _rescue_blank_turnstile(page, logger) -> bool:
-    """NAS/部分 Chromium 下 Turnstile 可能留下 about:blank 空 iframe，导致后续 render 不再执行。"""
+    """温和处理 Turnstile 空 iframe。
+
+    v1.3.5 会删除空 iframe 并重渲染；从日志看这可能打断 Cloudflare 自己的 crashed_retry。
+    v1.3.7 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
+    只有设置 KATABUMP_TURNSTILE_FORCE_RERENDER=1 时才启用旧的强制重渲染。
+    """
+    force = (os.environ.get("KATABUMP_TURNSTILE_FORCE_RERENDER") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not force:
+        try:
+            await page.evaluate("""() => {
+                for (const el of document.querySelectorAll('input, textarea')) {
+                    try { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } catch(e) {}
+                }
+                try { window.dispatchEvent(new Event('focus')); } catch(e) {}
+            }""")
+            _log(logger, "检测到 Turnstile 空 iframe，已采用温和等待策略（不删除 iframe，不打断 CF crashed_retry）")
+        except Exception:
+            pass
+        return True
     try:
         changed = await page.evaluate(
             """async () => {
@@ -629,6 +666,7 @@ class CfNetworkTracker:
         self.last_fail_url = ""
         self.last_fail_reason = ""
         self.fail_samples: List[str] = []
+        self.turnstile_crash_retries = 0
 
     def on_request_failed(self, req, logger=None):
         try:
@@ -646,6 +684,10 @@ class CfNetworkTracker:
             sample = f"{reason} @ {url[:120]}"
             if sample not in self.fail_samples and len(self.fail_samples) < 8:
                 self.fail_samples.append(sample)
+            if "turnstile" in url and "crashed_retry" in url:
+                self.turnstile_crash_retries += 1
+                if self.turnstile_crash_retries <= 3:
+                    _log(logger, f"⚠️ Turnstile 小组件 crashed_retry({self.turnstile_crash_retries})：更像容器 Chromium/WebGL/SwiftShader 运行环境问题，不是账号或家庭出口问题")
             if CF_HARD_FAIL_RE.search(reason) or reason in ("net::ERR_ABORTED", "net::ERR_FAILED"):
                 # ERR_ABORTED  alone 不一定致命（页面刷新也会 abort），配合 hard DNS 类错误才计分
                 if CF_HARD_FAIL_RE.search(reason):
@@ -746,7 +788,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                          f"请检查容器能否解析 challenges.cloudflare.com，或在插件配置代理（socks5 会自动走远程 DNS）")
             return False
 
-        if (not blank_rescue_attempted) and st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi") and waited > 8:
+        if (not blank_rescue_attempted) and st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi") and waited > 35:
             blank_rescue_attempted = True
             await _rescue_blank_turnstile(page, logger)
             await page.wait_for_timeout(2500)
@@ -780,7 +822,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                       "请检查容器/宿主机能否访问该域名，或在插件配置里填一个能正常访问 Cloudflare 的代理服务器")
     else:
         _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 已出现但没有拿到 token。"
-                      "在飞牛 NAS/家庭网络场景下，更常见原因是 MoviePilot 容器内 Chromium 与宿主机 Chrome 的 DNS/IPv6/浏览器组件差异，"
+                      "在飞牛 NAS/家庭网络场景下，更常见原因是 MoviePilot 容器内 Chromium 与宿主机 Chrome 的 WebGL/SwiftShader/沙箱/共享内存/DNS 差异，"
                       "不应直接判定为机房 IP；若宿主机 Chrome 可登录，请优先检查容器 DNS、IPv6、网络模式与 Chromium 依赖")
     return False
 
@@ -1192,7 +1234,9 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
     results = []
     # 注意：不要加 --disable-background-networking，会干扰 DoH / CF 挑战资源加载
     launch_args = [
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
+        "--no-sandbox", "--disable-setuid-sandbox",
+        # 不使用 --disable-gpu：Turnstile 在部分 headless Chromium 中需要可用的 WebGL/SwiftShader，
+        # 否则容易出现 /turnstile/.../crashed_retry + net::ERR_ABORTED。
         "--disable-dev-shm-usage", f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}",
         "--mute-audio", "--no-first-run", "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
@@ -1200,7 +1244,9 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-ipv6",
         "--enable-webgl",
+        "--enable-accelerated-2d-canvas",
     ]
+    launch_args.extend(nas_chromium_runtime_args())
 
     # 直连时：主域通但子域不通很常见，默认只要 need_dns_fix 或无代理就注入 CF 映射
     # （有代理且为 socks5h/http 时 DNS 多在代理侧完成，可不映射）
@@ -1221,7 +1267,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式：禁用 IPv6，随机 CF 挑战子域不做通配 IP 固定")
+        _log(logger, "NAS 兼容模式 v1.3.7：禁用 IPv6，随机 CF 挑战子域不做通配 IP 固定，并启用 SwiftShader/WebGL 兼容参数")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 

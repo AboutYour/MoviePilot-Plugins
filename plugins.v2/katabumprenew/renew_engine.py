@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.2"
+ENGINE_VERSION = "1.3.3"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -503,12 +503,15 @@ async def _get_turnstile_state(page) -> dict:
                 const vals = els.map(e => String(e.value || '').trim());
                 const token = vals.find(v => v.length > 20) || '';
                 const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                const iframes = Array.from(document.querySelectorAll('iframe')).filter(f => /turnstile|challenges\\.cloudflare/i.test(f.src||''));
+                const allIframes = Array.from(document.querySelectorAll('iframe'));
+                const iframes = allIframes.filter(f => /turnstile|challenges\\.cloudflare/i.test([f.src||'', f.title||'', f.name||'', f.id||''].join(' ')));
                 return {
                     required: els.length > 0 || containers.length > 0 || iframes.length > 0,
                     token, inputCount: els.length, iframeCount: iframes.length,
+                    allIframeCount: allIframes.length,
                     containerCount: containers.length,
-                    hasApi: typeof window.turnstile !== 'undefined'
+                    hasApi: typeof window.turnstile !== 'undefined',
+                    readyState: document.readyState
                 };
             }"""
         )
@@ -593,6 +596,31 @@ class CfNetworkTracker:
         return self.hard_fails >= 1
 
 
+async def _prefill_login_fields(page, user: Dict[str, str], logger=None) -> bool:
+    """先填账号密码再等 Turnstile。部分站点只有表单发生交互后才真正渲染/签发 Turnstile。"""
+    try:
+        email = page.locator('#email, input[name="email"], input[type="email"]').first
+        pwd = page.locator('#password, input[name="password"], input[type="password"]').first
+        await email.wait_for(state="visible", timeout=15000)
+        await email.fill("")
+        await email.fill(user["username"])
+        await pwd.fill("")
+        await pwd.fill(user["password"])
+        try:
+            await email.dispatch_event("input")
+            await email.dispatch_event("change")
+            await pwd.dispatch_event("input")
+            await pwd.dispatch_event("change")
+            await pwd.blur()
+        except Exception:
+            pass
+        _log(logger, "已预填账号密码并触发表单事件，随后等待 Turnstile token")
+        return True
+    except Exception as e:
+        _log(logger, f"预填账号密码失败，将继续按原流程等待: {e}")
+        return False
+
+
 async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                                cf_tracker: Optional[CfNetworkTracker] = None) -> bool:
     _log(logger, "检查 Cloudflare Turnstile token...")
@@ -645,6 +673,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
         if time.time() - last_log > 15:
             _log(logger, f"token 仍为空，已等待 {int(waited)}s/{timeout_s}s"
                           f"（container={st.get('containerCount', 0)} iframe={st.get('iframeCount', 0)} "
+                          f"all_iframe={st.get('allIframeCount', 0)} ready={st.get('readyState', '')} "
                           f"api={st.get('hasApi')} cf_net_fail={cf_tracker.hard_fails if cf_tracker else 0}）")
             last_log = time.time()
         await page.wait_for_timeout(1000)
@@ -850,24 +879,22 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
             await page.wait_for_timeout(2000)
         await page.wait_for_timeout(2000)
 
-        # 2) 登录：等待 Cloudflare Turnstile 首次令牌就绪
+        # 2) 登录：先填表再等待 Cloudflare Turnstile。
+        # 有些 Turnstile 配置会在用户输入/表单交互后才真正渲染 iframe 或签发 token。
+        await _prefill_login_fields(page, user, logger)
+        btn = page.locator('#submit, button[type="submit"], button:has-text("Login")').first
         ok = await wait_turnstile_token(page, logger, turnstile_wait, cf_tracker)
         if not ok:
             result["detail"] = _turnstile_fail_detail(cf_tracker)
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
             return result
 
-        _log(logger, "填写账号密码...")
+        _log(logger, "确认账号密码字段...")
         email = page.locator('#email, input[name="email"], input[type="email"]').first
         pwd = page.locator('#password, input[name="password"], input[type="password"]').first
-        btn = page.locator('#submit, button[type="submit"], button:has-text("Login")').first
-        await email.wait_for(state="visible", timeout=15000)
-        await email.fill("")
-        await email.fill(username)
-        await pwd.fill("")
-        await pwd.fill(user["password"])
 
-        # 填表可能触发页面刷新/重新校验，做一次短复检（≤20s）
+        # 等 token 期间页面可能刷新/重新渲染，提交前短复检并补填。
+        await _prefill_login_fields(page, user, logger)
         ok = await wait_turnstile_token(page, logger, min(20, turnstile_wait), cf_tracker)
         if not ok:
             result["detail"] = _turnstile_fail_detail(cf_tracker)

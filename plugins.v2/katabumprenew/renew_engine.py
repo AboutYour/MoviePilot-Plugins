@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.9"
+ENGINE_VERSION = "1.3.9 Diagnostic"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -54,7 +54,7 @@ DOH_TEMPLATES = (
 )
 
 CF_URL_RE = re.compile(
-    r"cloudflare|turnstile|challenges\.cloudflare\.com|cdn-cgi",
+    r"cloudflare|turnstile|challenges\\.cloudflare\.com|cdn-cgi",
     re.I,
 )
 # 明确属于“网络/DNS 不可达”的 Chromium 失败原因（不是 IP 信誉拒发 token）
@@ -569,6 +569,121 @@ async def _get_turnstile_state(page) -> dict:
         return {"required": False, "token": "", "inputCount": 0, "iframeCount": 0, "allIframeCount": 0, "containerCount": 0, "hasApi": False, "iframeBrief": [], "blankIframeCount": 0}
 
 
+async def _log_turnstile_diagnostics(page, logger, label: str = "") -> None:
+    """输出 Turnstile 诊断信息。
+
+    诊断版只读取页面状态，不尝试绕过验证。用于确认容器 Chromium 与宿主机
+    Chrome 的差异：Turnstile API 是否加载、iframe 是否被写入 src、资源是否失败、
+    webdriver/WebGL/插件/语言/安全上下文等是否异常。
+    """
+    try:
+        data = await page.evaluate(
+            """() => {
+                const str = (v, n=180) => {
+                    try { return String(v == null ? '' : v).slice(0, n); } catch(e) { return ''; }
+                };
+                const bool = v => !!v;
+                const pickAttrs = el => {
+                    if (!el) return {};
+                    const out = {};
+                    for (const a of Array.from(el.attributes || [])) out[a.name] = str(a.value, 160);
+                    return out;
+                };
+                const nav = {
+                    userAgent: str(navigator.userAgent, 240),
+                    webdriver: navigator.webdriver === undefined ? 'undefined' : String(navigator.webdriver),
+                    platform: str(navigator.platform),
+                    languages: Array.from(navigator.languages || []),
+                    language: str(navigator.language),
+                    pluginsLength: navigator.plugins ? navigator.plugins.length : -1,
+                    hardwareConcurrency: navigator.hardwareConcurrency || null,
+                    deviceMemory: navigator.deviceMemory || null,
+                    maxTouchPoints: navigator.maxTouchPoints || 0,
+                    cookieEnabled: navigator.cookieEnabled,
+                    doNotTrack: str(navigator.doNotTrack),
+                };
+                let webgl = { ok: false };
+                try {
+                    const canvas = document.createElement('canvas');
+                    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                    if (gl) {
+                        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                        webgl = {
+                            ok: true,
+                            vendor: dbg ? str(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), 160) : str(gl.getParameter(gl.VENDOR), 160),
+                            renderer: dbg ? str(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL), 220) : str(gl.getParameter(gl.RENDERER), 220),
+                        };
+                    }
+                } catch(e) { webgl = { ok: false, error: str(e.message || e) }; }
+                const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey]')).slice(0, 8).map((el, idx) => ({
+                    idx,
+                    tag: el.tagName,
+                    id: str(el.id),
+                    className: str(el.className, 160),
+                    dataSitekey: str(el.getAttribute('data-sitekey'), 80),
+                    dataAction: str(el.getAttribute('data-action'), 80),
+                    dataTheme: str(el.getAttribute('data-theme'), 40),
+                    dataSize: str(el.getAttribute('data-size'), 40),
+                    attrs: pickAttrs(el),
+                    html: str(el.outerHTML, 500),
+                }));
+                const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12).map((f, idx) => ({
+                    idx,
+                    srcAttr: str(f.getAttribute('src'), 260),
+                    srcProp: str(f.src, 260),
+                    title: str(f.getAttribute('title'), 100),
+                    name: str(f.getAttribute('name'), 120),
+                    id: str(f.getAttribute('id'), 100),
+                    sandbox: str(f.getAttribute('sandbox'), 180),
+                    allow: str(f.getAttribute('allow'), 180),
+                    loading: str(f.getAttribute('loading'), 40),
+                    parent: f.parentElement ? {tag:f.parentElement.tagName, id:str(f.parentElement.id), className:str(f.parentElement.className,160), dataSitekey:str(f.parentElement.getAttribute('data-sitekey'),80)} : null,
+                }));
+                const scripts = Array.from(document.scripts || []).map(s => s.src || '').filter(Boolean)
+                    .filter(u => /cloudflare|turnstile|challenge-platform|challenges/i.test(u)).slice(-20);
+                const resources = performance.getEntriesByType('resource')
+                    .filter(r => /cloudflare|turnstile|challenge-platform|challenges|cdn-cgi/i.test(r.name || ''))
+                    .slice(-30).map(r => ({
+                        name: str(r.name, 260),
+                        initiatorType: str(r.initiatorType, 40),
+                        duration: Math.round(r.duration || 0),
+                        transferSize: r.transferSize || 0,
+                        encodedBodySize: r.encodedBodySize || 0,
+                        decodedBodySize: r.decodedBodySize || 0,
+                        startTime: Math.round(r.startTime || 0),
+                    }));
+                const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')).map((i, idx) => ({idx, tag:i.tagName, valueLen:String(i.value||'').length, attrs:pickAttrs(i)}));
+                return {
+                    url: str(location.href, 240),
+                    title: str(document.title, 160),
+                    readyState: document.readyState,
+                    visibilityState: document.visibilityState,
+                    hasFocus: document.hasFocus ? document.hasFocus() : null,
+                    isSecureContext: window.isSecureContext,
+                    crossOriginIsolated: window.crossOriginIsolated,
+                    devicePixelRatio: window.devicePixelRatio,
+                    inner: {w: window.innerWidth, h: window.innerHeight},
+                    screen: {w: screen.width, h: screen.height, aw: screen.availWidth, ah: screen.availHeight},
+                    chromeType: typeof window.chrome,
+                    chromeKeys: window.chrome ? Object.keys(window.chrome).slice(0, 12) : [],
+                    turnstileType: typeof window.turnstile,
+                    turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 20) : [],
+                    bodyHasTurnstileText: /turnstile|cf-turnstile|challenges\\.cloudflare/i.test(document.body ? document.body.innerHTML : ''),
+                    nav, webgl, containers, iframes, inputs, scripts, resources,
+                };
+            }"""
+        )
+        import json as _json
+        txt = _json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        if len(txt) > 6500:
+            txt = txt[:6500] + "...(truncated)"
+        prefix = f"Turnstile 诊断{('[' + label + ']') if label else ''}"
+        _log(logger, f"{prefix}: {txt}")
+    except Exception as e:
+        _log(logger, f"Turnstile 诊断失败{('[' + label + ']') if label else ''}: {e}")
+
+
+
 async def _rescue_blank_turnstile(page, logger) -> bool:
     """温和处理 Turnstile 空 iframe。
 
@@ -778,6 +893,7 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
             _log(logger, f"Turnstile iframe 调试: {st.get('iframeBrief', [])}")
     except Exception:
         pass
+    await _log_turnstile_diagnostics(page, logger, "start")
     if st.get("token"):
         _log(logger, f"已有 Turnstile token（长度 {len(st['token'])}）")
         return True
@@ -842,9 +958,12 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                           f"（container={st.get('containerCount', 0)} iframe={st.get('iframeCount', 0)} "
                           f"all_iframe={st.get('allIframeCount', 0)} ready={st.get('readyState', '')} "
                           f"api={st.get('hasApi')} blank_iframe={st.get('blankIframeCount', 0)} cf_net_fail={cf_tracker.hard_fails if cf_tracker else 0}）")
+            if int(waited) in (0, 30, 61, 91) or (st.get("blankIframeCount", 0) > 0 and int(waited) in (15, 45, 76, 107)):
+                await _log_turnstile_diagnostics(page, logger, f"wait_{int(waited)}s")
             last_log = time.time()
         await page.wait_for_timeout(1000)
 
+    await _log_turnstile_diagnostics(page, logger, "timeout")
     if not saw_iframe:
         _log(logger, "❌ Turnstile token 超时仍为空 —— iframe 全程未渲染出来，大概率是当前网络访问不了 "
                       "challenges.cloudflare.com（DNS/出站被限制），不是单纯的 IP 信誉问题；"
@@ -1031,6 +1150,19 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         cf_tracker.on_request_failed(req, logger)
 
     page.on("requestfailed", _on_request_failed)
+    try:
+        page.on("console", lambda msg: _log(logger, f"页面 Console[{msg.type}]: {str(msg.text)[:240]}"))
+        page.on("pageerror", lambda exc: _log(logger, f"页面 JS 异常: {str(exc)[:300]}"))
+        def _on_response(resp):
+            try:
+                u = resp.url or ""
+                if CF_URL_RE.search(u):
+                    _log(logger, f"Cloudflare 响应: {resp.status} {u[:220]}")
+            except Exception:
+                pass
+        page.on("response", _on_response)
+    except Exception:
+        pass
 
     try:
         # 1) 先登出，隔离上个账号会话
@@ -1306,7 +1438,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式 v1.3.9：支持外部 Chrome/CDP；容器 Chromium 失败时可复用宿主机真实 Chrome")
+        _log(logger, "NAS 兼容模式 v1.3.9 Diagnostic：输出 Turnstile/浏览器/资源诊断，不再盲改流程")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 

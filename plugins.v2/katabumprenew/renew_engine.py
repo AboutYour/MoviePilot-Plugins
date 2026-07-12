@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.7"
+ENGINE_VERSION = "1.3.8"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -218,7 +218,7 @@ def build_cf_host_resolver_rules(logger=None, wildcard: bool = False) -> str:
     """
     生成 Chromium --host-resolver-rules。
 
-    v1.3.7 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
+    v1.3.8 调整：飞牛 NAS / 家庭宽带场景下，宿主机 Chrome 能正常登录，
     说明出口没有问题；强行把 *.challenges.cloudflare.com 映射到主域 IP
     可能让 Cloudflare 动态挑战资源出现 net::ERR_ABORTED / 空 iframe。
     因此默认只映射稳定主机，随机挑战子域优先交给 Chromium DoH 解析。
@@ -254,7 +254,6 @@ def chromium_doh_args() -> List[str]:
         "--enable-features=DnsOverHttps",
         "--dns-over-https-mode=automatic",
         f"--dns-over-https-templates={templates}",
-        "--disable-features=AsyncDns",
     ]
 
 
@@ -270,10 +269,11 @@ def nas_chromium_runtime_args() -> List[str]:
         "--use-gl=swiftshader",
         "--ignore-gpu-blocklist",
         "--enable-unsafe-swiftshader",
-        "--disable-software-rasterizer",
-        "--disable-features=site-per-process,IsolateOrigins,VizDisplayCompositor",
-        "--disable-site-isolation-trials",
+        # v1.3.8: 不再禁用 site isolation / VizDisplayCompositor。Turnstile 依赖跨域 iframe，
+        # 这些参数在部分容器 Chromium 中会造成空 iframe 或 crashed_retry。
         "--font-render-hinting=none",
+        "--password-store=basic",
+        "--use-mock-keychain",
     ]
 
 
@@ -573,7 +573,7 @@ async def _rescue_blank_turnstile(page, logger) -> bool:
     """温和处理 Turnstile 空 iframe。
 
     v1.3.5 会删除空 iframe 并重渲染；从日志看这可能打断 Cloudflare 自己的 crashed_retry。
-    v1.3.7 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
+    v1.3.8 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
     只有设置 KATABUMP_TURNSTILE_FORCE_RERENDER=1 时才启用旧的强制重渲染。
     """
     force = (os.environ.get("KATABUMP_TURNSTILE_FORCE_RERENDER") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -738,6 +738,35 @@ async def _prefill_login_fields(page, user: Dict[str, str], logger=None) -> bool
     except Exception as e:
         _log(logger, f"预填账号密码失败，将继续按原流程等待: {e}")
         return False
+
+
+async def _simulate_visible_user(page, logger=None) -> None:
+    """模拟普通可见浏览器里的轻量人工交互。
+
+    飞牛宿主机 Chrome 能登录但容器 Playwright iframe 一直 src 为空时，
+    常见是 headless/自动化环境没有触发 Turnstile 的可见性与交互检查。
+    这里不绕过验证，只补齐真实浏览器会自然产生的 focus、mousemove、scroll。
+    """
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    try:
+        await page.mouse.move(180, 160)
+        await page.wait_for_timeout(250)
+        await page.mouse.move(520, 420, steps=8)
+        await page.wait_for_timeout(250)
+        await page.mouse.wheel(0, 120)
+        await page.wait_for_timeout(250)
+        await page.mouse.wheel(0, -80)
+        await page.evaluate("""() => {
+            try { window.focus(); } catch(e) {}
+            try { document.body && document.body.dispatchEvent(new MouseEvent('mousemove', {bubbles:true, clientX:520, clientY:420})); } catch(e) {}
+            try { document.dispatchEvent(new Event('visibilitychange')); } catch(e) {}
+        }""")
+        _log(logger, "已模拟可见浏览器焦点/鼠标/滚动交互，帮助 Turnstile 正常初始化")
+    except Exception as e:
+        _log(logger, f"模拟可见浏览器交互失败，将继续等待: {e}")
 
 
 async def wait_turnstile_token(page, logger, timeout_s: int = 120,
@@ -1020,6 +1049,7 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         # 2) 登录：先填表再等待 Cloudflare Turnstile。
         # 有些 Turnstile 配置会在用户输入/表单交互后才真正渲染 iframe 或签发 token。
         await _prefill_login_fields(page, user, logger)
+        await _simulate_visible_user(page, logger)
         btn = page.locator('#submit, button[type="submit"], button:has-text("Login")').first
         ok = await wait_turnstile_token(page, logger, turnstile_wait, cf_tracker)
         if not ok:
@@ -1205,7 +1235,7 @@ STEALTH_SCRIPT = r"""
 """
 
 DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+              "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
 
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
@@ -1245,6 +1275,8 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
         "--disable-ipv6",
         "--enable-webgl",
         "--enable-accelerated-2d-canvas",
+        "--disable-search-engine-choice-screen",
+        "--disable-component-update",
     ]
     launch_args.extend(nas_chromium_runtime_args())
 
@@ -1267,7 +1299,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式 v1.3.7：禁用 IPv6，随机 CF 挑战子域不做通配 IP 固定，并启用 SwiftShader/WebGL 兼容参数")
+        _log(logger, "NAS 兼容模式 v1.3.8：保留跨域 iframe 隔离能力，启用 Chrome 138 UA、DoH 与可见浏览器交互模拟")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 
@@ -1305,6 +1337,9 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                 timezone_id="Asia/Shanghai",
                 color_scheme="light",
                 has_touch=False,
+                is_mobile=False,
+                device_scale_factor=1,
+                screen=VIEWPORT,
                 java_script_enabled=True,
                 extra_http_headers={
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",

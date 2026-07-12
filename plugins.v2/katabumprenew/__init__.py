@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.3.9.post1"
+    plugin_version = "1.4.0.diagnostic"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -315,8 +315,8 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.3.9 Diagnostic：新增 Turnstile/浏览器/资源诊断日志，用于定位容器 Chromium 空 iframe 根因。"
-                                            "1) 日志须出现「引擎 v1.3.9」。"
+                                    "text": "v1.4.0 Diagnostic：新增原生函数、Cloudflare 内部状态、CSP 与 A/B 无隐身脚本探针。"
+                                            "1) 日志须出现「引擎 v1.4.0 Diagnostic」。"
                                             "2) 若继续空 iframe，优先使用 CDP 模式而不是继续调整代理。"
                                             "3) 不建议开启无头模式。",
                                 },

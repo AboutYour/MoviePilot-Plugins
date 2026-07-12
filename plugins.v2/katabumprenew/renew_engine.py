@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.3.9 Diagnostic"
+ENGINE_VERSION = "1.4.0 Diagnostic"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -653,6 +653,35 @@ async def _log_turnstile_diagnostics(page, logger, label: str = "") -> None:
                         startTime: Math.round(r.startTime || 0),
                     }));
                 const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')).map((i, idx) => ({idx, tag:i.tagName, valueLen:String(i.value||'').length, attrs:pickAttrs(i)}));
+                const fnSig = fn => {
+                    try { return Function.prototype.toString.call(fn).slice(0, 260); } catch(e) { try { return String(fn).slice(0, 260); } catch(e2) { return ''; } }
+                };
+                const nativeCheck = s => /\[native code\]/.test(String(s || ''));
+                const nativeFns = {
+                    postMessage: fnSig(window.postMessage),
+                    postMessageNative: nativeCheck(fnSig(window.postMessage)),
+                    createElement: fnSig(document.createElement),
+                    createElementNative: nativeCheck(fnSig(document.createElement)),
+                    appendChild: fnSig(Node.prototype.appendChild),
+                    appendChildNative: nativeCheck(fnSig(Node.prototype.appendChild)),
+                    insertBefore: fnSig(Node.prototype.insertBefore),
+                    insertBeforeNative: nativeCheck(fnSig(Node.prototype.insertBefore)),
+                    fetch: fnSig(window.fetch),
+                    fetchNative: nativeCheck(fnSig(window.fetch)),
+                    xhrOpen: fnSig(XMLHttpRequest.prototype.open),
+                    xhrOpenNative: nativeCheck(fnSig(XMLHttpRequest.prototype.open)),
+                    iframeSrcDescriptor: (() => { try { const d = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src'); return {get: fnSig(d && d.get), set: fnSig(d && d.set)}; } catch(e) { return {error: str(e.message || e)}; } })(),
+                };
+                const cfState = (() => {
+                    const out = {};
+                    try { out.cfParamsType = typeof window.__CF$cv$params; } catch(e) {}
+                    try { out.cfBmType = typeof window.__cf_bm; } catch(e) {}
+                    try { out.turnstilePrivateKeys = window.turnstile && window.turnstile._private ? Object.keys(window.turnstile._private).slice(0, 40) : []; } catch(e) { out.turnstilePrivateError = str(e.message || e); }
+                    try { out.turnstilePrivateStr = window.turnstile && window.turnstile._private ? str(JSON.stringify(window.turnstile._private, (k,v) => typeof v === 'function' ? '[function]' : v), 1200) : ''; } catch(e) { out.turnstilePrivateStr = '[unserializable]'; }
+                    try { out.globalCfKeys = Object.getOwnPropertyNames(window).filter(k => /cf|turnstile|chl|challenge/i.test(k)).slice(0, 80); } catch(e) {}
+                    return out;
+                })();
+                const csp = Array.from(document.querySelectorAll('meta[http-equiv]')).map(m => ({equiv:str(m.getAttribute('http-equiv'),80), content:str(m.getAttribute('content'),600)})).filter(x => /content-security-policy|permissions-policy|feature-policy/i.test(x.equiv));
                 return {
                     url: str(location.href, 240),
                     title: str(document.title, 160),
@@ -669,14 +698,14 @@ async def _log_turnstile_diagnostics(page, logger, label: str = "") -> None:
                     turnstileType: typeof window.turnstile,
                     turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 20) : [],
                     bodyHasTurnstileText: /turnstile|cf-turnstile|challenges\\.cloudflare/i.test(document.body ? document.body.innerHTML : ''),
-                    nav, webgl, containers, iframes, inputs, scripts, resources,
+                    nav, webgl, nativeFns, cfState, csp, containers, iframes, inputs, scripts, resources,
                 };
             }"""
         )
         import json as _json
         txt = _json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        if len(txt) > 6500:
-            txt = txt[:6500] + "...(truncated)"
+        if len(txt) > 12000:
+            txt = txt[:12000] + "...(truncated)"
         prefix = f"Turnstile 诊断{('[' + label + ']') if label else ''}"
         _log(logger, f"{prefix}: {txt}")
     except Exception as e:
@@ -1375,6 +1404,50 @@ def is_cdp_endpoint(value: str) -> bool:
     return v.startswith("http://") or v.startswith("https://") or v.startswith("ws://") or v.startswith("wss://")
 
 
+
+async def _diagnostic_ab_probe(p, login_url: str, exe: str, launch_kwargs: dict, launch_args: list, ua: str, logger) -> None:
+    """A/B 探针：不注入 STEALTH_SCRIPT 打开登录页一次，仅采集诊断。"""
+    if (os.environ.get("KATABUMP_SKIP_AB_PROBE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        _log(logger, "A/B 无隐身脚本探针已跳过（KATABUMP_SKIP_AB_PROBE=1）")
+        return
+    browser = context = page = None
+    try:
+        kwargs = dict(launch_kwargs)
+        kwargs["args"] = list(launch_args)
+        browser = await (p.chromium.launch(executable_path=exe, **kwargs) if exe else p.chromium.launch(**kwargs))
+        context = await browser.new_context(
+            viewport=VIEWPORT,
+            user_agent=ua,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            color_scheme="light",
+            has_touch=False,
+            is_mobile=False,
+            device_scale_factor=1,
+            screen=VIEWPORT,
+            java_script_enabled=True,
+            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+        )
+        page = await context.new_page()
+        page.on("console", lambda msg: _log(logger, f"A/B无隐身 Console[{msg.type}]: {msg.text[:500]}"))
+        page.on("pageerror", lambda exc: _log(logger, f"A/B无隐身 JS异常: {exc}"))
+        page.on("response", lambda resp: (_log(logger, f"A/B无隐身 CF响应: {resp.status} {resp.url}") if re.search(r"cloudflare|turnstile|challenge-platform|cdn-cgi", resp.url, re.I) else None))
+        page.on("requestfailed", lambda req: (_log(logger, f"A/B无隐身 请求失败: {req.url} ({req.failure})") if re.search(r"cloudflare|turnstile|challenge-platform|cdn-cgi", req.url, re.I) else None))
+        await page.goto(login_url or LOGIN_URL_DEFAULT, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(12000)
+        await _log_turnstile_diagnostics(page, logger, "AB_no_stealth_12s")
+        _log(logger, "A/B 无隐身脚本探针完成：正式流程将继续")
+    except Exception as e:
+        _log(logger, f"A/B 无隐身脚本探针失败: {e}")
+    finally:
+        for obj in (page, context, browser):
+            try:
+                if obj:
+                    await obj.close()
+            except Exception:
+                pass
+
+
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
                   logger=None, chrome_path: str = "", turnstile_wait: int = 120,
                   renew_attempts: int = 3, headless: bool = False,
@@ -1438,7 +1511,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
             _log(logger, f"生成 host-resolver-rules 失败: {e}")
         launch_args.extend(chromium_doh_args())
         _log(logger, "已启用 Chrome-like DNS-over-HTTPS automatic（NAS 兼容模式）")
-        _log(logger, "NAS 兼容模式 v1.3.9 Diagnostic：输出 Turnstile/浏览器/资源诊断，不再盲改流程")
+        _log(logger, "NAS 兼容模式 v1.4.0 Diagnostic：增加原生函数/CF状态/A-B无隐身脚本探针")
     else:
         _log(logger, "跳过 DNS 修复（使用代理，DNS 交给代理侧）")
 
@@ -1455,6 +1528,8 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                              f"{' (带认证)' if proxy_dict.get('username') else ''}")
 
             browser = None
+            if not cdp_endpoint:
+                await _diagnostic_ab_probe(p, login_url or LOGIN_URL_DEFAULT, exe, launch_kwargs, launch_args, ua, logger)
             if cdp_endpoint:
                 try:
                     browser = await p.chromium.connect_over_cdp(cdp_endpoint, timeout=30000)
@@ -1490,7 +1565,11 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 },
             )
-            await context.add_init_script(STEALTH_SCRIPT)
+            if (os.environ.get("KATABUMP_DISABLE_STEALTH") or "").strip().lower() in ("1", "true", "yes", "on"):
+                _log(logger, "正式流程未注入 STEALTH_SCRIPT（KATABUMP_DISABLE_STEALTH=1），用于对比诊断")
+            else:
+                await context.add_init_script(STEALTH_SCRIPT)
+                _log(logger, "正式流程已注入 STEALTH_SCRIPT；诊断会输出 nativeFns 判断是否误改关键原生函数")
             try:
                 for i, user in enumerate(accounts):
                     _log(logger, f"=== 处理账号 {i+1}/{len(accounts)}: {user['username']} ===")

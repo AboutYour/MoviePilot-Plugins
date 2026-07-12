@@ -12,16 +12,41 @@ import asyncio
 import glob
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
-
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
 VIEWPORT = {"width": 1280, "height": 720}
+
+# Cloudflare 挑战相关域名：连这些都解析/连不通时，等满 Turnstile 超时没有意义
+CF_PROBE_HOSTS = (
+    "challenges.cloudflare.com",
+    "cdn-cgi.cloudflare.com",
+)
+CF_URL_RE = re.compile(
+    r"cloudflare|turnstile|challenges\.cloudflare\.com|cdn-cgi",
+    re.I,
+)
+# 明确属于“网络/DNS 不可达”的 Chromium 失败原因（不是 IP 信誉拒发 token）
+CF_HARD_FAIL_RE = re.compile(
+    r"ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|"
+    r"ERR_CONNECTION_CLOSED|ERR_CONNECTION_TIMED_OUT|ERR_TIMED_OUT|"
+    r"ERR_ADDRESS_UNREACHABLE|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED|"
+    r"ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|"
+    r"ERR_SOCKS_CONNECTION_FAILED|ERR_NAME_RESOLUTION_FAILED",
+    re.I,
+)
+
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+)
 
 
 def _log(logger, msg: str):
@@ -32,12 +57,166 @@ def _log(logger, msg: str):
 
 
 # ============================================================
+# 代理解析 / Cloudflare 连通性探测
+# ============================================================
+def _env_proxy_raw() -> str:
+    for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def parse_proxy_server(raw: str) -> Optional[Dict[str, str]]:
+    """
+    把用户输入/环境变量里的代理串解析成 Playwright 可用的 dict。
+
+    - socks5:// 自动改成 socks5h://（DNS 走代理，解决容器内 DNS 解析不了 CF 子域的问题）
+    - 支持 user:pass@host:port 拆到 username/password（Playwright 不认写在 server 里的账号密码）
+    - 无 scheme 时默认 http://
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    # 裸 host:port
+    if "://" not in raw:
+        raw = "http://" + raw
+
+    # DNS 经代理解析：容器 DNS 常解不了 *.challenges.cloudflare.com
+    if raw.lower().startswith("socks5://"):
+        raw = "socks5h://" + raw[len("socks5://"):]
+
+    try:
+        u = urlparse(raw)
+    except Exception:
+        return {"server": raw}
+
+    if not u.hostname:
+        return {"server": raw}
+
+    scheme = (u.scheme or "http").lower()
+    # Playwright 认识 socks5 / socks5h / http / https
+    if scheme == "socks5":
+        scheme = "socks5h"
+
+    server = f"{scheme}://{u.hostname}"
+    if u.port:
+        server += f":{u.port}"
+    else:
+        # 缺省端口
+        if scheme in ("http", "https"):
+            server += ":80" if scheme == "http" else ":443"
+        elif scheme in ("socks5", "socks5h"):
+            server += ":1080"
+
+    out: Dict[str, str] = {"server": server}
+    if u.username:
+        out["username"] = unquote(u.username)
+    if u.password:
+        out["password"] = unquote(u.password)
+    return out
+
+
+def _tcp_reachable(host: str, port: int = 443, timeout: float = 5.0) -> Tuple[bool, str]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, "ok"
+    except socket.gaierror as e:
+        return False, f"DNS 失败: {e}"
+    except OSError as e:
+        return False, f"连接失败: {e}"
+    except Exception as e:
+        return False, f"异常: {e}"
+
+
+def probe_cloudflare(logger=None, timeout: float = 5.0) -> bool:
+    """直连探测 challenges.cloudflare.com 是否可达（不走代理）。"""
+    ok_any = False
+    details = []
+    for host in CF_PROBE_HOSTS:
+        ok, reason = _tcp_reachable(host, 443, timeout)
+        details.append(f"{host}={'ok' if ok else reason}")
+        if ok:
+            ok_any = True
+    _log(logger, "Cloudflare 直连探测: " + "; ".join(details))
+    return ok_any
+
+
+def resolve_browser_proxy(
+    proxy_server: str,
+    proxy_mode: str,
+    logger=None,
+) -> Tuple[Optional[Dict[str, str]], str]:
+    """
+    决定 Playwright 使用的代理。
+
+    proxy_mode:
+      - auto   : 先测 CF 直连；不通再回退到配置代理 / 环境代理
+      - direct : 强制直连（并清环境代理）
+      - system : 用环境变量里的代理
+      - custom : 只用配置里的 proxy_server
+    返回 (playwright_proxy_dict 或 None, 策略说明)
+    """
+    mode = (proxy_mode or "auto").strip().lower()
+    if mode not in ("auto", "direct", "system", "custom"):
+        mode = "auto"
+
+    cfg_raw = (proxy_server or "").strip()
+    env_raw = _env_proxy_raw()
+    cfg = parse_proxy_server(cfg_raw) if cfg_raw else None
+    env = parse_proxy_server(env_raw) if env_raw else None
+
+    if mode == "custom":
+        if not cfg:
+            _log(logger, "proxy_mode=custom 但未填写代理，将直连")
+            return None, "custom→直连(未配置)"
+        _log(logger, f"使用配置代理: {cfg.get('server')}")
+        return cfg, "custom"
+
+    if mode == "system":
+        if not env:
+            _log(logger, "proxy_mode=system 但环境无 HTTP(S)_PROXY，将直连")
+            return None, "system→直连(无环境代理)"
+        _log(logger, f"使用系统环境代理: {env.get('server')}")
+        return env, "system"
+
+    if mode == "direct":
+        _log(logger, "强制直连（忽略配置/环境代理）")
+        return None, "direct"
+
+    # ---- auto ----
+    # 配置里显式写了代理：优先用配置（用户意图最明确）
+    if cfg:
+        _log(logger, f"auto：使用配置代理 {cfg.get('server')}")
+        return cfg, "auto→custom"
+
+    # 无配置：先测 CF 直连
+    if probe_cloudflare(logger):
+        if env:
+            _log(logger, "auto：Cloudflare 直连可达，忽略环境代理，走住宅/本机出口")
+        else:
+            _log(logger, "auto：Cloudflare 直连可达，使用直连")
+        return None, "auto→direct"
+
+    # 直连不通：回退环境代理（常见于容器 DNS 坏了、或需 Clash 才能访问 CF）
+    if env:
+        _log(logger, f"auto：Cloudflare 直连不可达，回退环境代理 {env.get('server')} "
+                     f"（DNS 将尽量走代理，请确认该代理能访问 challenges.cloudflare.com）")
+        return env, "auto→system"
+
+    _log(logger, "auto：Cloudflare 直连不可达，且无可用代理。"
+                 "Turnstile iframe 大概率无法渲染；请在插件里填能访问 Cloudflare 的代理，"
+                 "或修复容器 DNS/出站网络")
+    return None, "auto→direct(CF不可达)"
+
+
+# ============================================================
 # chromium 自动安装：MoviePilot 容器有 playwright 库和系统依赖，
 # 但不一定有 chromium 二进制。首次运行自动补装一次。
 # ============================================================
 def ensure_chromium(logger=None) -> Optional[str]:
     """确保有可用的 chromium，返回可执行路径（None 表示用 playwright 默认）。"""
-    # 1) 已装的 playwright chromium
     candidates = []
     ms_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
     search_roots = [ms_root] if ms_root else []
@@ -45,6 +224,7 @@ def ensure_chromium(logger=None) -> Optional[str]:
         os.path.expanduser("~/.cache/ms-playwright"),
         "/ms-playwright",
         "/root/.cache/ms-playwright",
+        "/moviepilot/.cache/ms-playwright",
     ]
     for root in search_roots:
         if not root:
@@ -56,7 +236,6 @@ def ensure_chromium(logger=None) -> Optional[str]:
             _log(logger, f"发现已安装的 chromium: {c}")
             return c
 
-    # 2) 没有则用 playwright 安装
     _log(logger, "未发现 chromium，尝试自动安装（首次约 150MB，请稍候）...")
     try:
         subprocess.run(
@@ -126,7 +305,60 @@ async def _render_turnstile(page, logger):
         _log(logger, f"Turnstile 主动渲染失败: {e}")
 
 
-async def wait_turnstile_token(page, logger, timeout_s: int = 120) -> bool:
+class CfNetworkTracker:
+    """跟踪页面内 Cloudflare 资源加载失败，用于尽早判定“网络不可达”。"""
+
+    def __init__(self):
+        self.hard_fails = 0
+        self.last_fail_url = ""
+        self.last_fail_reason = ""
+        self.fail_samples: List[str] = []
+
+    def on_request_failed(self, req, logger=None):
+        try:
+            url = req.url or ""
+            if not CF_URL_RE.search(url):
+                return
+            reason = ""
+            try:
+                reason = req.failure or ""
+            except Exception:
+                reason = ""
+            reason = str(reason or "")
+            self.last_fail_url = url
+            self.last_fail_reason = reason
+            sample = f"{reason} @ {url[:120]}"
+            if sample not in self.fail_samples and len(self.fail_samples) < 8:
+                self.fail_samples.append(sample)
+            if CF_HARD_FAIL_RE.search(reason) or reason in ("net::ERR_ABORTED", "net::ERR_FAILED"):
+                # ERR_ABORTED  alone 不一定致命（页面刷新也会 abort），配合 hard DNS 类错误才计分
+                if CF_HARD_FAIL_RE.search(reason):
+                    self.hard_fails += 1
+                    _log(logger, f"⚠️ Cloudflare 网络失败({self.hard_fails}): {url[:160]}（{reason}）")
+                else:
+                    # 软失败只记日志一次
+                    if self.hard_fails == 0 and len(self.fail_samples) <= 2:
+                        _log(logger, f"⚠️ Cloudflare 请求中止: {url[:160]}（{reason}）")
+            elif reason:
+                if self.hard_fails == 0 and len(self.fail_samples) <= 2:
+                    _log(logger, f"⚠️ Cloudflare 请求失败: {url[:160]}（{reason}）")
+        except Exception:
+            pass
+
+    def should_early_abort(self, saw_iframe: bool, waited_s: float) -> bool:
+        """
+        iframe 一直没出来 + 已出现明确的 DNS/连接失败 → 不必空等到满超时。
+        至少等 12s 给页面一次 reload 机会。
+        """
+        if saw_iframe:
+            return False
+        if waited_s < 12:
+            return False
+        return self.hard_fails >= 1
+
+
+async def wait_turnstile_token(page, logger, timeout_s: int = 120,
+                               cf_tracker: Optional[CfNetworkTracker] = None) -> bool:
     _log(logger, "检查 Cloudflare Turnstile token...")
     st = await _get_turnstile_state(page)
     if st.get("token"):
@@ -155,19 +387,29 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120) -> bool:
         if st.get("token"):
             _log(logger, f"已获得 Turnstile token（长度 {len(st['token'])}）")
             return True
-        if not reloaded and st.get("required") and st.get("iframeCount", 0) == 0 and time.time() - start > 10:
+
+        waited = time.time() - start
+        if cf_tracker and cf_tracker.should_early_abort(saw_iframe, waited):
+            _log(logger, f"❌ 提前结束等待（已等 {int(waited)}s）：检测到 Cloudflare 挑战域名网络/DNS 失败 "
+                         f"（{cf_tracker.last_fail_reason}），iframe 未渲染。"
+                         f"请检查容器能否解析 challenges.cloudflare.com，或在插件配置代理（socks5 会自动走远程 DNS）")
+            return False
+
+        if not reloaded and st.get("required") and st.get("iframeCount", 0) == 0 and waited > 10:
             reloaded = True
             _log(logger, "iframe 未渲染，刷新登录页重试一次...")
-            await page.reload(wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                _log(logger, f"刷新登录页失败: {e}")
             await page.wait_for_timeout(3000)
             await _render_turnstile(page, logger)
             await page.wait_for_timeout(2000)
             continue
         if time.time() - last_log > 15:
-            waited = int(time.time() - start)
-            _log(logger, f"token 仍为空，已等待 {waited}s/{timeout_s}s"
+            _log(logger, f"token 仍为空，已等待 {int(waited)}s/{timeout_s}s"
                           f"（container={st.get('containerCount', 0)} iframe={st.get('iframeCount', 0)} "
-                          f"api={st.get('hasApi')}，需住宅 IP 完成官方验证）")
+                          f"api={st.get('hasApi')} cf_net_fail={cf_tracker.hard_fails if cf_tracker else 0}）")
             last_log = time.time()
         await page.wait_for_timeout(1000)
 
@@ -257,7 +499,6 @@ async def _click_altcha(page, logger) -> bool:
             cx = box["x"] + min(25, max(12, box["w"] * 0.15))
             cy = box["y"] + box["h"] / 2
         await _cdp_click(page, cx, cy, logger)
-        # shadow DOM 内兜底再点一次
         await page.evaluate(
             """() => {
                 const w = document.querySelector('altcha-widget');
@@ -330,6 +571,15 @@ async def _safe_shot(page, path: str):
         return None
 
 
+def _turnstile_fail_detail(cf_tracker: Optional[CfNetworkTracker]) -> str:
+    if cf_tracker and cf_tracker.hard_fails > 0:
+        return ("Cloudflare 挑战服务网络/DNS 不可达"
+                f"（{cf_tracker.last_fail_reason or 'unknown'}）；"
+                "请修复容器 DNS/出站，或在插件配置可访问 Cloudflare 的代理")
+    return ("Cloudflare Turnstile 未通过"
+            "（出口 IP 未通过官方验证，或挑战页未加载；请用住宅网络/住宅代理）")
+
+
 async def process_account(context, user: Dict[str, str], login_url: str, shot_dir: Path,
                           logger, turnstile_wait: int, renew_attempts: int) -> Dict:
     username = user["username"]
@@ -343,16 +593,11 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
     except Exception:
         pass
 
-    # 直接监听网络失败：如果连 Cloudflare 挑战/资源域名都请求失败，
-    # 说明是网络可达性问题（DNS/出站被限制），而不是 IP 信誉判定，
-    # 这类日志比单纯"token 仍为空"更能定位根因。
+    cf_tracker = CfNetworkTracker()
+
     def _on_request_failed(req):
-        try:
-            url = req.url
-            if re.search(r"cloudflare|turnstile|challenges\.cloudflare\.com", url, re.I):
-                _log(logger, f"⚠️ 网络请求失败: {url}（原因: {req.failure}）—— 若持续出现，说明当前网络访问不了 Cloudflare 挑战服务，需检查出站网络或配置代理")
-        except Exception:
-            pass
+        cf_tracker.on_request_failed(req, logger)
+
     page.on("requestfailed", _on_request_failed)
 
     try:
@@ -369,11 +614,10 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
             await page.wait_for_timeout(2000)
         await page.wait_for_timeout(2000)
 
-        # 2) 登录：等待 Cloudflare Turnstile 首次令牌就绪（结果必须判断，否则超时后
-        #    仍会往下走，且下面还会再等一次满额超时，白白卡住 2 倍时长）
-        ok = await wait_turnstile_token(page, logger, turnstile_wait)
+        # 2) 登录：等待 Cloudflare Turnstile 首次令牌就绪
+        ok = await wait_turnstile_token(page, logger, turnstile_wait, cf_tracker)
         if not ok:
-            result["detail"] = "Cloudflare Turnstile 未通过（当前出口 IP 无法通过官方验证，请改用住宅网络运行，或在插件配置中填写代理服务器）"
+            result["detail"] = _turnstile_fail_detail(cf_tracker)
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
             return result
 
@@ -387,10 +631,10 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         await pwd.fill("")
         await pwd.fill(user["password"])
 
-        # 填表可能触发页面刷新/重新校验，做一次短复检（≤20s），不再重复整段超时等待
-        ok = await wait_turnstile_token(page, logger, min(20, turnstile_wait))
+        # 填表可能触发页面刷新/重新校验，做一次短复检（≤20s）
+        ok = await wait_turnstile_token(page, logger, min(20, turnstile_wait), cf_tracker)
         if not ok:
-            result["detail"] = "Cloudflare Turnstile 未通过（当前出口 IP 无法通过官方验证，请改用住宅网络运行，或在插件配置中填写代理服务器）"
+            result["detail"] = _turnstile_fail_detail(cf_tracker)
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
             return result
 
@@ -466,7 +710,6 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
             _log(logger, "点击弹框内 Renew 确认...")
             await confirm.click()
 
-            # 检查“还没到续期时间” / 验证码错误
             captcha_err = False
             not_yet = False
             date_str = ""
@@ -534,20 +777,14 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
 
 
 # 反自动化检测脚本：Playwright 启动的 chromium 默认带 navigator.webdriver=true 等自动化痕迹，
-# Cloudflare Turnstile 一旦识别到就拒绝发令牌（这就是桌面版 WebView2 能过、裸 Playwright 过不了的根本原因）。
-# 下面这段在每个文档创建前注入，抹掉最常见的自动化指纹，尽量贴近真实浏览器。
+# Cloudflare Turnstile 一旦识别到就拒绝发令牌。
 STEALTH_SCRIPT = r"""
 (() => {
   try {
-    // 1) navigator.webdriver -> undefined
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    // 2) 伪造 plugins / mimeTypes 非空
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    // 3) languages
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-    // 4) window.chrome 存在（无头/自动化下常缺失）
     if (!window.chrome) { window.chrome = { runtime: {} }; }
-    // 5) permissions.query 对 notifications 返回 default（自动化下常报 denied）
     const origQuery = window.navigator.permissions && window.navigator.permissions.query;
     if (origQuery) {
       window.navigator.permissions.query = (params) => (
@@ -556,7 +793,6 @@ STEALTH_SCRIPT = r"""
           : origQuery(params)
       );
     }
-    // 6) WebGL vendor/renderer 伪装成常见显卡
     const getParam = WebGLRenderingContext.prototype.getParameter;
     WebGLRenderingContext.prototype.getParameter = function (p) {
       if (p === 37445) return 'Intel Inc.';
@@ -574,28 +810,25 @@ DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path,
                   logger=None, chrome_path: str = "", turnstile_wait: int = 120,
                   renew_attempts: int = 3, headless: bool = False,
-                  proxy_server: str = "", user_agent: str = "") -> List[Dict]:
+                  proxy_server: str = "", proxy_mode: str = "auto",
+                  user_agent: str = "") -> List[Dict]:
     from playwright.async_api import async_playwright
 
-    # 关键：除非用户明确配置了 proxy_server，否则清掉环境变量里的代理。
-    # MoviePilot/Clash 常在环境中带 HTTP_PROXY，会把浏览器出口拐到机房 IP，
-    # 导致 Turnstile 永远不发令牌（和桌面版直连住宅 IP 行为不一致）。
+    # 决定代理策略；浏览器侧只用 launch proxy，避免环境变量与 launch 双重代理
+    proxy_dict, strategy = resolve_browser_proxy(proxy_server, proxy_mode, logger)
+    _log(logger, f"代理策略: {strategy}")
+
+    # 清掉环境代理，避免 Playwright 子进程再读一层与 launch 冲突
     saved_proxy_env = {}
-    proxy_env_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
-    if not proxy_server.strip():
-        for k in proxy_env_keys:
-            if k in os.environ:
-                saved_proxy_env[k] = os.environ.pop(k)
-        if saved_proxy_env:
-            _log(logger, f"已临时清除环境代理，浏览器直连住宅出口: {list(saved_proxy_env.keys())}")
-    else:
-        _log(logger, f"使用用户配置的代理: {proxy_server.strip()}")
+    for k in PROXY_ENV_KEYS:
+        if k in os.environ:
+            saved_proxy_env[k] = os.environ.pop(k)
+    if saved_proxy_env:
+        _log(logger, f"已临时清除环境代理变量（改由 Playwright proxy 注入）: {list(saved_proxy_env.keys())}")
 
     exe = chrome_path.strip() or ensure_chromium(logger)
     ua = user_agent.strip() or DEFAULT_UA
     results = []
-    # 关键：--disable-blink-features=AutomationControlled 关掉自动化标志；
-    # 配合 ignore_default_args 去掉 --enable-automation，避免暴露为自动化会话。
     launch_args = [
         "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}",
@@ -611,10 +844,11 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                 "args": launch_args,
                 "ignore_default_args": ["--enable-automation"],
             }
-            if proxy_server.strip():
-                launch_kwargs["proxy"] = {"server": proxy_server.strip()}
-            # 优先用真实 Chrome 渠道（指纹比 bundled chromium 更真实，更容易过 Turnstile）；
-            # 指定了 executable_path 时用它，否则尝试 channel="chrome"，都失败再退回 bundled chromium。
+            if proxy_dict:
+                launch_kwargs["proxy"] = proxy_dict
+                _log(logger, f"浏览器代理: {proxy_dict.get('server')}"
+                             f"{' (带认证)' if proxy_dict.get('username') else ''}")
+
             browser = None
             if exe:
                 try:
@@ -656,7 +890,6 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                 except Exception:
                     pass
     finally:
-        # 还原环境代理
         for k, v in saved_proxy_env.items():
             os.environ[k] = v
     return results

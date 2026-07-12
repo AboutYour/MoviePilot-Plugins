@@ -31,13 +31,13 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
 1. 把 `package.v2.json`、`plugins.v2/` 推到你的 GitHub 仓库（分支 `main`）。
 2. MoviePilot → 设置 → 插件 → 插件仓库，填入仓库地址 `https://github.com/<你的用户名>/MoviePilot-Plugins`。
 3. 在插件市场找到「Katabump自动续期」，点安装。
-3. 打开插件配置：
+4. 打开插件配置：
    - **启用插件**
    - **账号列表 (JSON)**：`[{"username":"a@x.com","password":"pwd1"}, {"username":"b@x.com","password":"pwd2"}]`
    - **执行周期**：默认 `30 3 */3 * *`（每 3 天凌晨 3:30）；按你的续期周期调整
    - **发送通知**：开启后每轮结束把汇总推到 MP 通知
    - 其余（Turnstile 等待、续期重试、Chrome 路径）保持默认即可
-4. 保存。可勾「立即运行一次」验证。
+5. 保存。可勾「立即运行一次」验证。
 
 ## 配置项说明
 
@@ -46,15 +46,53 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
 | 账号列表 (JSON) | 账号数组，字段 `username`/`password`，与桌面版 `login.json` 兼容 |
 | 执行周期 (cron) | 标准 5 段 cron，MP 本地时区 |
 | 登录地址 | 默认 `https://dashboard.katabump.com/auth/login` |
-| Turnstile 等待(秒) | 等令牌就绪的上限，默认 120 |
+| Turnstile 等待(秒) | 等令牌就绪的上限，默认 120；若已判定 CF 网络失败会提前结束 |
 | 续期重试次数 | Renew/ALTCHA 失败重试，默认 3 |
 | 无头模式 | 默认关闭。Turnstile/ALTCHA 需要“有头”环境，容器里配合 xvfb |
 | Chrome 路径(可选) | 留空自动用容器内 chromium；也可指定宿主挂进来的 Chrome |
-| 代理服务器(可选) | `http://user:pass@host:port` 或 `socks5://host:port`。MoviePilot 跑在云端/机房时，填一个住宅代理可绕开 Turnstile 的 IP 限制 |
+| 代理模式 | `auto`（默认）/ `direct` / `system` / `custom`，见下 |
+| 代理服务器(可选) | `http://user:pass@host:port` 或 `socks5://host:port` |
+
+### 代理模式
+
+| 模式 | 行为 |
+|---|---|
+| **auto（推荐）** | 先 TCP 探测 `challenges.cloudflare.com`；直连可达则直连；不可达则回退环境 `HTTP(S)_PROXY`；若填写了代理字段则优先用配置代理 |
+| **direct** | 强制直连，忽略环境代理与配置代理 |
+| **system** | 使用容器环境变量里的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` |
+| **custom** | 只用「代理服务器」字段 |
+
+`socks5://` 会自动改成 `socks5h://`（**DNS 走代理**），避免容器 DNS 解析不了 `*.challenges.cloudflare.com`。
 
 ## 注意
 
-- Cloudflare Turnstile 只认住宅出口 IP；机房/云 IP 直连会一直卡在日志里的 `token 仍为空...需住宅 IP 完成官方验证`，最终以 `Cloudflare Turnstile 未通过` 失败收场（这是预期行为，不是插件报错）。
-- 两种解法：① 把 MoviePilot（或至少本插件的运行环境）放在家里的 NAS/住宅网络；② 在插件配置的**代理服务器**里填一个住宅代理，让 Playwright 走代理出口。
+### 两类失败要分清
+
+1. **网络/DNS 失败**（日志里有 `ERR_NAME_NOT_RESOLVED`、`challenges.cloudflare.com` 请求失败、iframe=0）  
+   - 容器访问不了 Cloudflare 挑战服务。  
+   - 处理：修 DNS/出站，或填一个能访问 Cloudflare 的代理（`proxy_mode=custom` + 代理地址）。
+
+2. **IP 信誉失败**（iframe 能渲染，但 token 一直为空）  
+   - 出口被 Cloudflare 判定为机房/云 IP。  
+   - 处理：住宅网络直连，或**住宅代理**。
+
 - 首次运行下载 chromium 稍慢，属正常。
 - 截图保存在插件数据目录 `screenshots/` 下，历史记录可在插件详情页查看。
+
+## 容器内自检（可选）
+
+```bash
+# DNS / 连通性
+getent hosts challenges.cloudflare.com
+# 或
+nslookup challenges.cloudflare.com
+curl -I --max-time 10 https://challenges.cloudflare.com
+```
+
+若这里就失败，插件里也过不了 Turnstile，必须先解决网络或挂代理。
+
+## 版本
+
+- **v1.2.0**：CF 连通性预检、代理 auto 回退、socks5h 远程 DNS、网络失败提前结束等待
+- **v1.1.0**：反自动化检测、直连优先、真实 Chrome 渠道
+- **v1.0.0**：初版续期流程

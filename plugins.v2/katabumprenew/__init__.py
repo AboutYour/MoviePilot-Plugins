@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -56,6 +56,8 @@ class KatabumpRenew(_PluginBase):
     _renew_attempts = 3          # 续期重试次数
     _headless = False            # Turnstile/ALTCHA 需要“有头”，默认 False（配合 xvfb）
     _proxy_server = ""           # 可选：代理服务器（非住宅网络运行时，用住宅代理过 Turnstile）
+    # auto=CF 直连探测后必要时回退环境代理；direct=强制直连；system=环境代理；custom=仅用下方代理
+    _proxy_mode = "auto"
 
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
@@ -73,6 +75,7 @@ class KatabumpRenew(_PluginBase):
         self._renew_attempts = 3
         self._headless = False
         self._proxy_server = ""
+        self._proxy_mode = "auto"
 
         if config:
             self._enabled = bool(config.get("enabled"))
@@ -86,6 +89,8 @@ class KatabumpRenew(_PluginBase):
             self._renew_attempts = int(config.get("renew_attempts") or 3)
             self._headless = bool(config.get("headless"))
             self._proxy_server = (config.get("proxy_server") or "").strip()
+            mode = (config.get("proxy_mode") or "auto").strip().lower()
+            self._proxy_mode = mode if mode in ("auto", "direct", "system", "custom") else "auto"
 
         # 停掉旧调度
         self.stop_service()
@@ -117,6 +122,7 @@ class KatabumpRenew(_PluginBase):
             "renew_attempts": self._renew_attempts,
             "headless": self._headless,
             "proxy_server": self._proxy_server,
+            "proxy_mode": self._proxy_mode,
         })
 
     def get_state(self) -> bool:
@@ -258,7 +264,7 @@ class KatabumpRenew(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -270,12 +276,29 @@ class KatabumpRenew(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "proxy_mode",
+                                        "label": "代理模式",
+                                        "items": [
+                                            {"title": "自动(推荐：CF 不通则回退环境代理)", "value": "auto"},
+                                            {"title": "强制直连(忽略环境代理)", "value": "direct"},
+                                            {"title": "使用系统环境代理", "value": "system"},
+                                            {"title": "仅用下方填写的代理", "value": "custom"},
+                                        ],
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
                                         "model": "proxy_server",
-                                        "label": "代理服务器(可选，非住宅网络时用于过 Cloudflare)",
+                                        "label": "代理服务器(可选)",
                                         "placeholder": "http://user:pass@host:port 或 socks5://host:port",
                                     },
                                 }],
@@ -292,10 +315,12 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "1) 必须用住宅出口（家里 NAS 直连即可）。Clash/机房代理通常过不了 Turnstile，"
-                                            "插件默认不走系统代理，除非你在上方单独填「住宅代理」。"
-                                            "2) 不要开「无头模式」。3) 首次运行会自动下载 chromium。"
-                                            "4) 桌面版能过、插件过不了，多半是浏览器自动化指纹；v1.1.0 已加反检测。",
+                                    "text": "1) 日志若出现 ERR_NAME_NOT_RESOLVED / challenges.cloudflare.com 失败，是容器访问不了 Cloudflare，"
+                                            "不是账号问题：填能访问 CF 的代理，或修容器 DNS。"
+                                            "2) 代理模式默认「自动」：CF 直连可达则直连；不可达则回退 HTTP(S)_PROXY。"
+                                            "3) socks5 会自动改为 socks5h（DNS 走代理），避免容器 DNS 解不了 CF 子域。"
+                                            "4) Turnstile 还要求出口像住宅 IP；机房代理即使通了 CF 也可能不发 token。"
+                                            "5) 不要开无头模式；首次运行会自动下载 chromium。",
                                 },
                             }],
                         }],
@@ -314,6 +339,7 @@ class KatabumpRenew(_PluginBase):
             "renew_attempts": 3,
             "headless": False,
             "proxy_server": "",
+            "proxy_mode": "auto",
         }
 
     def get_page(self) -> List[dict]:
@@ -468,4 +494,5 @@ class KatabumpRenew(_PluginBase):
             renew_attempts=self._renew_attempts,
             headless=self._headless,
             proxy_server=self._proxy_server,
+            proxy_mode=self._proxy_mode,
         )

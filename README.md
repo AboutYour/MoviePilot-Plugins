@@ -39,6 +39,10 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
    - 其余（Turnstile 等待、续期重试、Chrome 路径）保持默认即可
 5. 保存。可勾「立即运行一次」验证。
 
+如果仓库中的插件刚修改过 ID 或目录名（例如 `NodeSeekSign` 改为
+`NodeSeekSignBatch`），请先在插件市场执行强制刷新，或重启 MoviePilot 后再安装。
+MoviePilot 的安装器会缓存插件索引最长 30 分钟；市场页面显示新名称时，安装接口仍可能暂时使用旧索引。
+
 ## 配置项说明
 
 | 配置 | 说明 |

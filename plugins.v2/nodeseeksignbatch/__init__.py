@@ -41,7 +41,7 @@ class NodeSeekSignBatch(_PluginBase):
     plugin_name = "NodeSeek / DeepFlood 多账号签到"
     plugin_desc = "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     plugin_author = "madrays / kbmgr"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "nodeseeksignbatch_"

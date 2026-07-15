@@ -37,14 +37,14 @@ except Exception:
     HAS_CURL_CFFI = False
 
 
-class nodeseeksign(_PluginBase):
-    plugin_name = "NodeSeek / DeepFlood 签到"
+class NodeSeekSignBatch(_PluginBase):
+    plugin_name = "NodeSeek / DeepFlood 多账号签到"
     plugin_desc = "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     plugin_author = "madrays / kbmgr"
     author_url = "https://github.com/madrays"
-    plugin_config_prefix = "nodeseeksign_"
+    plugin_config_prefix = "nodeseeksignbatch_"
     plugin_order = 1
     auth_level = 2
 
@@ -144,7 +144,7 @@ class nodeseeksign(_PluginBase):
                 func=self.sign,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="NodeSeek/DeepFlood签到(单次)",
+                name="NodeSeek/DeepFlood多账号签到(单次)",
             )
             self._scheduler.start()
 
@@ -546,7 +546,7 @@ class nodeseeksign(_PluginBase):
             )
         self.post_message(
             mtype=NotificationType.SiteMessage,
-            title="【NodeSeek / DeepFlood 签到】",
+            title="【NodeSeek / DeepFlood 多账号签到】",
             text="\n".join(lines),
         )
 
@@ -561,8 +561,8 @@ class nodeseeksign(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
             return [{
-                "id": "nodeseeksign",
-                "name": "NodeSeek/DeepFlood签到",
+                "id": "nodeseeksignbatch",
+                "name": "NodeSeek/DeepFlood多账号签到",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.sign,
                 "kwargs": {},
@@ -705,7 +705,7 @@ class nodeseeksign(_PluginBase):
             "component": "VCard",
             "props": {"variant": "outlined"},
             "content": [
-                {"component": "VCardTitle", "text": "NodeSeek / DeepFlood 签到历史"},
+                {"component": "VCardTitle", "text": "NodeSeek / DeepFlood 多账号签到历史"},
                 {
                     "component": "VCardText",
                     "content": [{

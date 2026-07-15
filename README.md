@@ -93,6 +93,7 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 
 ## 版本
 
+- **v1.5.1**：修复 Turnstile 空 iframe；默认关闭 A/B 预探针和指纹篡改；空白 30 秒后强制重建；修复 Python 转义警告
 - **v1.5.0**：同步 Android 一键签到逻辑；账号独立会话；宽容定位 See/Renew；ALTCHA 稳定确认；严格校验本轮 See/Renew；记录 Expiry
 - **v1.3.2**：修复主域通、随机子域（brunhild.*）不通时误关 DNS 映射；直连强制 `MAP *.challenges.cloudflare.com`
 - **v1.3.0**：公共 DNS 预解析 + host-resolver-rules / DoH；读取 `PROXY_HOST`；启动打印引擎版本
@@ -103,10 +104,10 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 ### 如何确认已更新到最新版
 
 ```text
-[Katabump] 插件版本 1.5.0 ...
-[Katabump] ======== Katabump 引擎 v1.5.0 启动 ========
+[Katabump] 插件版本 1.5.1 ...
+[Katabump] ======== Katabump 引擎 v1.5.1 启动 ========
 [Katabump] 将 *.challenges.cloudflare.com 全部映射到 104.x.x.x
 [Katabump] 已注入 host-resolver-rules ...
 ```
 
-没有 `v1.5.0` / `host-resolver-rules` 说明未更新成功：卸载重装插件并重启 MoviePilot。
+没有 `v1.5.1` / `host-resolver-rules` 说明未更新成功：卸载重装插件并重启 MoviePilot。

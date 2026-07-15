@@ -15,12 +15,13 @@
   "KatabumpRenew": {
     "name": "Katabump自动续期",
     "description": "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到 MoviePilot 通知。需在住宅网络（如家里的 NAS）运行才能通过 Cloudflare 验证。",
-    "version": "1.5.0",
+    "version": "1.5.1",
     "level": 1,
     "author": "kbmgr",
     "authorUrl": "https://github.com/AboutYour",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png",
     "history": {
+      "v1.5.1": "修复 Turnstile 空 iframe：默认关闭 A/B 预探针和指纹篡改，持续空白 30 秒后强制重建一次，并修复 Python 转义警告。",
       "v1.5.0": "同步 Android 一键签到：账号独立会话、备注/用途、宽容 See/Renew 定位、ALTCHA 稳定确认、阶段校验与 Expiry 记录。",
       "v1.4.1": "新增浏览器模式，支持优先系统 Chrome/Edge、CDP 与 Playwright Chromium 对比。",
       "v1.4.0 Diagnostic": "新增原生函数、Cloudflare 内部状态、CSP 与 A/B 无隐身脚本探针。",

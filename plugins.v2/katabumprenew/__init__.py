@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -338,9 +338,8 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.5.0：同步 Android 一键签到逻辑。每个账号使用独立会话；支持账号备注/用途；"
-                                            "宽容定位 See/View/Manage 与 Renew/Extend；ALTCHA 稳定验证后再确认；"
-                                            "仅在本轮完成 See/Renew 后判定成功，并记录 Expiry。",
+                                    "text": "v1.5.1：修复 Turnstile 空 iframe。默认不预跑 A/B 挑战、不篡改浏览器指纹；"
+                                            "持续空白 30 秒后自动强制重建一次。system_chrome 不存在时仍会回退内置 Chromium。",
                                 },
                             }],
                         }],

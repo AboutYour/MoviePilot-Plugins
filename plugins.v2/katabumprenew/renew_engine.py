@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.5.0"
+ENGINE_VERSION = "1.5.1"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
@@ -718,14 +718,18 @@ async def _log_turnstile_diagnostics(page, logger, label: str = "") -> None:
 
 
 
-async def _rescue_blank_turnstile(page, logger) -> bool:
+async def _rescue_blank_turnstile(page, logger, force: bool = False) -> bool:
     """温和处理 Turnstile 空 iframe。
 
     v1.3.5 会删除空 iframe 并重渲染；从日志看这可能打断 Cloudflare 自己的 crashed_retry。
     v1.3.9 默认不删除 iframe，只触发表单交互并等待 CF 自恢复。
-    只有设置 KATABUMP_TURNSTILE_FORCE_RERENDER=1 时才启用旧的强制重渲染。
+    首次检测只温和等待；持续空白约 30 秒后由调用方强制重建一次。
+    KATABUMP_TURNSTILE_FORCE_RERENDER=1 可从首次检测就启用强制重建。
     """
-    force = (os.environ.get("KATABUMP_TURNSTILE_FORCE_RERENDER") or "").strip().lower() in ("1", "true", "yes", "on")
+    env_force = (os.environ.get("KATABUMP_TURNSTILE_FORCE_RERENDER") or "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    force = force or env_force
     if not force:
         try:
             await page.evaluate("""() => {
@@ -746,6 +750,10 @@ async def _rescue_blank_turnstile(page, logger) -> bool:
                 if (!containers.length) return false;
                 let removed = 0;
                 for (const c of containers) {
+                    const widgetId = c.getAttribute('data-turnstile-widget-id');
+                    if (widgetId && window.turnstile && typeof window.turnstile.remove === 'function') {
+                        try { window.turnstile.remove(widgetId); } catch (e) {}
+                    }
                     for (const f of Array.from(c.querySelectorAll('iframe'))) {
                         const src = String(f.getAttribute('src') || f.src || '').trim();
                         if (!src || src === 'about:blank') {
@@ -753,6 +761,7 @@ async def _rescue_blank_turnstile(page, logger) -> bool:
                             removed++;
                         }
                     }
+                    c.replaceChildren();
                     c.removeAttribute('data-turnstile-widget-id');
                     delete c.dataset.__r;
                 }
@@ -972,9 +981,10 @@ async def wait_turnstile_token(page, logger, timeout_s: int = 120,
                          f"请检查容器能否解析 challenges.cloudflare.com，或在插件配置代理（socks5 会自动走远程 DNS）")
             return False
 
-        if (not blank_rescue_attempted) and st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi") and waited > 35:
+        if (not blank_rescue_attempted) and st.get("blankIframeCount", 0) > 0 and st.get("containerCount", 0) > 0 and st.get("hasApi") and waited > 30:
             blank_rescue_attempted = True
-            await _rescue_blank_turnstile(page, logger)
+            _log(logger, "Turnstile iframe 持续空白超过 30 秒，执行一次强制重建")
+            await _rescue_blank_turnstile(page, logger, force=True)
             await page.wait_for_timeout(2500)
             st = await _get_turnstile_state(page)
             if st.get("token"):
@@ -1214,7 +1224,7 @@ async def _find_action(page, kind: str):
     selector = "a,button,input,[role=button],.btn"
     try:
         index = await page.evaluate(
-            """({selector, kind}) => {
+            r"""({selector, kind}) => {
                 const elements = Array.from(document.querySelectorAll(selector));
                 const words = kind === 'renew' ? ['renew', 'extend'] : ['see', 'view', 'manage', 'details', 'detail'];
                 const textOf = el => ((el.innerText || el.textContent || el.value ||
@@ -1618,8 +1628,14 @@ def is_cdp_endpoint(value: str) -> bool:
 
 async def _diagnostic_ab_probe(p, login_url: str, exe: str, launch_kwargs: dict, launch_args: list, ua: str, logger) -> None:
     """A/B 探针：不注入 STEALTH_SCRIPT 打开登录页一次，仅采集诊断。"""
-    if (os.environ.get("KATABUMP_SKIP_AB_PROBE") or "").strip().lower() in ("1", "true", "yes", "on"):
-        _log(logger, "A/B 无隐身脚本探针已跳过（KATABUMP_SKIP_AB_PROBE=1）")
+    enabled = (os.environ.get("KATABUMP_ENABLE_AB_PROBE") or "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    skipped = (os.environ.get("KATABUMP_SKIP_AB_PROBE") or "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    if not enabled or skipped:
+        _log(logger, "默认跳过 A/B 探针，避免正式签到前重复触发 Cloudflare；诊断时可设置 KATABUMP_ENABLE_AB_PROBE=1")
         return
     browser = context = page = None
     try:
@@ -1800,9 +1816,13 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 },
             )
-            disable_stealth = (os.environ.get("KATABUMP_DISABLE_STEALTH") or "").strip().lower() in (
+            enable_stealth = (os.environ.get("KATABUMP_ENABLE_STEALTH") or "").strip().lower() in (
                 "1", "true", "yes", "on"
             )
+            if (os.environ.get("KATABUMP_DISABLE_STEALTH") or "").strip().lower() in (
+                "1", "true", "yes", "on"
+            ):
+                enable_stealth = False
             try:
                 for i, user in enumerate(accounts):
                     display_name = user.get("name") or user.get("remark") or user["username"]
@@ -1812,11 +1832,11 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                         # Android clears cookies/cache/history before every batch item. A new
                         # BrowserContext provides the same isolation without stale async state.
                         context = await browser.new_context(**context_options)
-                        if disable_stealth:
-                            _log(logger, "当前账号未注入 STEALTH_SCRIPT（KATABUMP_DISABLE_STEALTH=1）")
-                        else:
+                        if enable_stealth:
                             await context.add_init_script(STEALTH_SCRIPT)
-                            _log(logger, "当前账号已使用全新会话并注入 STEALTH_SCRIPT")
+                            _log(logger, "当前账号已使用全新会话并按 KATABUMP_ENABLE_STEALTH=1 注入 STEALTH_SCRIPT")
+                        else:
+                            _log(logger, "当前账号已使用全新原生会话（默认不篡改浏览器指纹）")
                         res = await process_account(
                             context, user, login_url or LOGIN_URL_DEFAULT,
                             shot_dir, logger, turnstile_wait, renew_attempts,

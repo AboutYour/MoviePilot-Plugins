@@ -4,7 +4,7 @@ Katabump 续期核心引擎（Python + Playwright）。
 从 Node 版 action_renew.js 移植：
 - 登录：等 Cloudflare Turnstile 令牌就绪再提交（必要时主动 turnstile.render()）
 - 续期：See → Renew → 解 ALTCHA（穿透 shadow DOM + 真实点击）→ 确认 → 截图
-- 顺序处理多账号，每个账号独立会话（登录前先 logout）
+- 顺序处理多账号，每个账号使用独立 BrowserContext（Cookie/缓存完全隔离）
 
 引擎不依赖 MoviePilot，可单独测试；日志通过传入的 logger 输出。
 """
@@ -22,11 +22,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-ENGINE_VERSION = "1.4.1"
+ENGINE_VERSION = "1.5.0"
 
 LOGIN_URL_DEFAULT = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
 VIEWPORT = {"width": 1280, "height": 720}
+
+
+def _looks_like_login_url(url: str) -> bool:
+    value = (url or "").lower()
+    return "/auth" in value or "login" in value
 
 # Cloudflare 挑战相关域名：连这些都解析/连不通时，等满 Turnstile 超时没有意义
 CF_PROBE_HOSTS = (
@@ -862,7 +867,12 @@ class CfNetworkTracker:
 async def _prefill_login_fields(page, user: Dict[str, str], logger=None) -> bool:
     """先填账号密码再等 Turnstile。部分站点只有表单发生交互后才真正渲染/签发 Turnstile。"""
     try:
-        email = page.locator('#email, input[name="email"], input[type="email"]').first
+        email = page.locator(
+            '#email, #username, #user, #login, #account, #identifier, '
+            'input[name="email"], input[name="username"], input[name="user"], '
+            'input[name="login"], input[name="account"], input[name="identifier"], '
+            'input[autocomplete="username"], input[type="email"]'
+        ).first
         pwd = page.locator('#password, input[name="password"], input[type="password"]').first
         await email.wait_for(state="visible", timeout=15000)
         await email.fill("")
@@ -1012,20 +1022,45 @@ async def _get_altcha_status(page) -> dict:
         return await page.evaluate(
             """() => {
                 const norm = v => v == null ? '' : String(v).trim();
+                const deepQuery = (root, selector) => {
+                    if (!root) return null;
+                    const direct = root.querySelector(selector);
+                    if (direct) return direct;
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot) {
+                            const found = deepQuery(el.shadowRoot, selector);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                const deepText = root => {
+                    if (!root) return '';
+                    let text = root.textContent || '';
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot) text += ' ' + deepText(el.shadowRoot);
+                    }
+                    return text.toLowerCase();
+                };
                 const w = document.querySelector('altcha-widget');
                 const inputs = Array.from(document.querySelectorAll('input[name="altcha"], textarea[name="altcha"], input[name*="altcha" i], textarea[name*="altcha" i]'));
                 const filled = inputs.find(i => norm(i.value).length > 0);
                 const sr = w ? w.shadowRoot : null;
-                const cb = sr ? sr.querySelector('input[type="checkbox"], [role="checkbox"]') : null;
+                const cb = w ? deepQuery(w, 'input[type="checkbox"], [role="checkbox"]') : null;
                 const state = norm(w ? (w.state || w.getAttribute('state')) : '');
                 const valLen = Math.max(norm(w ? w.value : '').length, norm(w ? w.getAttribute('value') : '').length);
                 const hiddenLen = norm(filled ? filled.value : '').length;
                 const checked = cb && typeof cb.checked === 'boolean' ? cb.checked : null;
                 const aria = norm(cb ? cb.getAttribute('aria-checked') : '');
                 const busy = norm(w ? w.getAttribute('aria-busy') : '');
-                const solved = state === 'verified' || valLen > 0 || hiddenLen > 0;
+                const widgetText = deepText(w);
+                const visibleVerified = widgetText.includes('verified') &&
+                    !widgetText.includes('not verified') && !widgetText.includes('verifying');
+                const hasToken = valLen > 0 || hiddenLen > 0;
+                const solved = visibleVerified && (checked === true || aria === 'true' || hasToken);
                 const verifying = !solved && (['verifying','processing','working'].includes(state) || checked === true || aria === 'true' || busy === 'true');
-                return { exists: !!w || inputs.length > 0, solved, verifying, state: state || 'unknown', hasShadow: !!sr };
+                return { exists: !!w || inputs.length > 0, solved, verifying, state: state || 'unknown',
+                         hasShadow: !!sr, visibleVerified, hasToken };
             }"""
         )
     except Exception:
@@ -1151,6 +1186,151 @@ async def _safe_shot(page, path: str):
         return None
 
 
+EXPIRY_RE = re.compile(
+    r"Expiry\s*:?\s*((?:[0-9]{4}[\/-][0-9]{1,2}[\/-][0-9]{1,2})|"
+    r"(?:[0-9]{1,2}[\/-][0-9]{1,2}[\/-][0-9]{2,4})|"
+    r"(?:[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4})|"
+    r"(?:[A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4}))",
+    re.I,
+)
+
+
+async def _body_text(page) -> str:
+    try:
+        return await page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
+
+
+async def _extract_expiry(page) -> str:
+    """Mirror the Android one-click check-in expiry extraction rules."""
+    text = re.sub(r"\s+", " ", await _body_text(page))
+    match = EXPIRY_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+async def _find_action(page, kind: str):
+    """Find See/Renew using the Android watcher's exact-then-contains strategy."""
+    selector = "a,button,input,[role=button],.btn"
+    try:
+        index = await page.evaluate(
+            """({selector, kind}) => {
+                const elements = Array.from(document.querySelectorAll(selector));
+                const words = kind === 'renew' ? ['renew', 'extend'] : ['see', 'view', 'manage', 'details', 'detail'];
+                const textOf = el => ((el.innerText || el.textContent || el.value ||
+                    el.getAttribute('aria-label') || el.getAttribute('title') || '') + '')
+                    .toLowerCase().replace(/\s+/g, ' ').trim();
+                const visible = el => {
+                    const style = getComputedStyle(el);
+                    const box = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        parseFloat(style.opacity || '1') >= 0.05 && box.width >= 2 && box.height >= 2;
+                };
+                const inNav = el => {
+                    for (let node = el, depth = 0; node && depth < 6; node = node.parentElement, depth++) {
+                        const tag = (node.tagName || '').toLowerCase();
+                        const cls = String(node.className || '').toLowerCase();
+                        if (tag === 'nav' || tag === 'aside' || cls.includes('sidebar') ||
+                            cls.includes('navbar') || cls.includes('menu') || cls.includes('nav-')) return true;
+                    }
+                    return false;
+                };
+                const allowed = (el, pass) => {
+                    if (!visible(el) || inNav(el)) return false;
+                    const text = textOf(el);
+                    const href = String(el.getAttribute('href') || el.href || '').toLowerCase();
+                    if (href.includes('logout') || href.includes('account') ||
+                        href.includes('billing') || href.includes('/auth')) return false;
+                    if (kind === 'renew' && (text.includes('easy renewal') ||
+                        text.includes('auto renew') || text.includes('renew period'))) return false;
+                    if (kind === 'see' && (href.includes('/server') || href.includes('server/'))) return true;
+                    return words.some(word => pass === 0 ? text === word : text.includes(word));
+                };
+                for (let pass = 0; pass < 2; pass++) {
+                    const found = elements.findIndex(el => allowed(el, pass));
+                    if (found >= 0) return found;
+                }
+                return -1;
+            }""",
+            {"selector": selector, "kind": kind},
+        )
+        return page.locator(selector).nth(index) if isinstance(index, int) and index >= 0 else None
+    except Exception:
+        return None
+
+
+async def _safe_click(locator) -> bool:
+    if locator is None:
+        return False
+    try:
+        await locator.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        await locator.click(timeout=10000)
+        return True
+    except Exception:
+        try:
+            await locator.evaluate(
+                """el => {
+                    for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                        el.dispatchEvent(new MouseEvent(type, {bubbles:true,cancelable:true,view:window}));
+                    }
+                    if (typeof el.click === 'function') el.click();
+                }"""
+            )
+            return True
+        except Exception:
+            return False
+
+
+async def _find_renew_dialog(page):
+    dialogs = page.locator(
+        '[role="dialog"], .modal.show, .modal[aria-modal="true"], .modal-content, .swal2-popup'
+    )
+    try:
+        count = await dialogs.count()
+    except Exception:
+        return None
+    for index in range(count - 1, -1, -1):
+        dialog = dialogs.nth(index)
+        try:
+            if not await dialog.is_visible():
+                continue
+            text = (await dialog.inner_text()).lower()
+            if "extend the life" in text or ("altcha" in text and "renew" in text):
+                return dialog
+        except Exception:
+            continue
+    return None
+
+
+async def _find_modal_renew(dialog):
+    buttons = dialog.locator(
+        '.modal-footer button, .modal-footer a, .swal2-actions button, '
+        'button, input[type="submit"], a.btn, [role="button"]'
+    )
+    try:
+        count = await buttons.count()
+    except Exception:
+        return None
+    fallback = None
+    for index in range(count):
+        button = buttons.nth(index)
+        try:
+            if not await button.is_visible():
+                continue
+            text = ((await button.inner_text()) or await button.get_attribute("value") or "").strip().lower()
+            if text != "renew":
+                continue
+            if await button.evaluate("el => !!el.closest('.modal-footer, .swal2-actions')"):
+                return button
+            fallback = button
+        except Exception:
+            continue
+    return fallback
+
+
 def _turnstile_fail_detail(cf_tracker: Optional[CfNetworkTracker]) -> str:
     if cf_tracker and cf_tracker.hard_fails > 0:
         return ("Cloudflare 挑战服务网络/DNS 不可达"
@@ -1161,11 +1341,22 @@ def _turnstile_fail_detail(cf_tracker: Optional[CfNetworkTracker]) -> str:
 
 
 async def process_account(context, user: Dict[str, str], login_url: str, shot_dir: Path,
-                          logger, turnstile_wait: int, renew_attempts: int) -> Dict:
+                           logger, turnstile_wait: int, renew_attempts: int) -> Dict:
     username = user["username"]
+    display_name = str(user.get("name") or user.get("remark") or username).strip() or username
     safe = re.sub(r"[^a-z0-9]", "_", username, flags=re.I)
-    result = {"name": username, "success": False, "detail": "", "screenshot": "",
-              "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    result = {
+        "name": display_name,
+        "username": username,
+        "purpose": str(user.get("purpose") or "").strip(),
+        "success": False,
+        "detail": "",
+        "expiry": "",
+        "saw_see": False,
+        "clicked_renew": False,
+        "screenshot": "",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
     page = await context.new_page()
     page.set_default_timeout(60000)
     try:
@@ -1194,10 +1385,8 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         pass
 
     try:
-        # 1) 先登出，隔离上个账号会话
-        if "dashboard" in page.url:
-            await page.goto(LOGOUT_URL)
-            await page.wait_for_timeout(2000)
+        # Each account receives a fresh BrowserContext in run_all. This mirrors Android's
+        # removeAllCookies/clearCache behavior and prevents cross-account state leakage.
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
         if "dashboard" in page.url and "login" not in page.url:
@@ -1211,149 +1400,171 @@ async def process_account(context, user: Dict[str, str], login_url: str, shot_di
         # 有些 Turnstile 配置会在用户输入/表单交互后才真正渲染 iframe 或签发 token。
         await _prefill_login_fields(page, user, logger)
         await _simulate_visible_user(page, logger)
-        btn = page.locator('#submit, button[type="submit"], button:has-text("Login")').first
-        ok = await wait_turnstile_token(page, logger, turnstile_wait, cf_tracker)
-        if not ok:
-            result["detail"] = _turnstile_fail_detail(cf_tracker)
-            result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
-            return result
+        for login_attempt in range(1, 3):
+            ok = await wait_turnstile_token(
+                page, logger,
+                turnstile_wait if login_attempt == 1 else min(30, turnstile_wait),
+                cf_tracker,
+            )
+            if not ok:
+                result["detail"] = _turnstile_fail_detail(cf_tracker)
+                result["screenshot"] = await _safe_shot(
+                    page, str(shot_dir / f"{safe}_turnstile_fail.png")
+                ) or ""
+                return result
 
-        _log(logger, "确认账号密码字段...")
-        email = page.locator('#email, input[name="email"], input[type="email"]').first
-        pwd = page.locator('#password, input[name="password"], input[type="password"]').first
+            # The Android login watcher refills controlled inputs and requires a two-second
+            # stable token window before every submit attempt.
+            await _prefill_login_fields(page, user, logger)
+            await page.wait_for_timeout(2000)
+            btn = page.locator(
+                '#submit, button[type="submit"], input[type="submit"], '
+                'button:has-text("Login"), button:has-text("Log in"), '
+                'button:has-text("Sign in"), button:has-text("Continue")'
+            ).first
+            try:
+                await btn.wait_for(state="visible", timeout=10000)
+            except Exception:
+                result["detail"] = "未找到登录提交按钮"
+                break
 
-        # 等 token 期间页面可能刷新/重新渲染，提交前短复检并补填。
-        await _prefill_login_fields(page, user, logger)
-        ok = await wait_turnstile_token(page, logger, min(20, turnstile_wait), cf_tracker)
-        if not ok:
-            result["detail"] = _turnstile_fail_detail(cf_tracker)
-            result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_turnstile_fail.png")) or ""
-            return result
+            _log(logger, f"点击登录（{login_attempt}/2）...")
+            await _safe_click(btn)
+            await page.wait_for_timeout(5000)
+            if not _looks_like_login_url(page.url):
+                break
+            if login_attempt < 2:
+                _log(logger, "仍在登录页，重新填表并等待新 Turnstile token 后重试")
+                await _prefill_login_fields(page, user, logger)
 
-        # 令牌等待期间可能刷新过页面，补填
-        await email.fill("")
-        await email.fill(username)
-        await pwd.fill("")
-        await pwd.fill(user["password"])
-        await btn.wait_for(state="visible", timeout=10000)
-        await page.wait_for_timeout(800)
-
-        _log(logger, "点击登录...")
-        try:
-            async with page.expect_navigation(timeout=30000):
-                await btn.click(timeout=15000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(3000)
-
-        if "/auth/login" in page.url:
-            result["detail"] = "登录后仍在登录页（账号密码错误或验证未提交）"
+        if _looks_like_login_url(page.url):
+            if not result["detail"]:
+                result["detail"] = "登录后仍在登录页（账号密码错误或验证未提交）"
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_login_fail.png")) or ""
             return result
 
-        # 3) 找 See 进入服务器详情
-        _log(logger, '寻找 "See" 链接...')
-        try:
-            see = page.get_by_role("link", name="See").first
-            await see.wait_for(timeout=15000)
-            await page.wait_for_timeout(1000)
-            await see.click()
-        except Exception:
-            result["detail"] = "未找到 See 链接（登录可能未成功）"
+        # 3) Find See/View/Manage/Details or a server URL, matching the Android watcher.
+        _log(logger, '寻找 "See/View/Manage/Details" 入口...')
+        see = await _find_action(page, "see")
+        if not await _safe_click(see):
+            result["detail"] = "未找到 See/View/Manage/Details 入口（登录可能未成功）"
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_no_see.png")) or ""
             return result
+        result["saw_see"] = True
+        await page.wait_for_timeout(3000)
+        result["expiry"] = await _extract_expiry(page)
 
-        # 4) Renew 循环
+        # 4) Renew loop. A success is valid only after this run clicked both See and the
+        # modal Renew confirmation, matching PanelWebActivity.stageComplete.
+        action_deadline = time.time() + 120
         for attempt in range(1, renew_attempts + 1):
-            if "login" in page.url:
+            if time.time() >= action_deadline:
+                result["detail"] = "签到超时（120 秒）"
+                break
+            if _looks_like_login_url(page.url):
                 result["detail"] = "被重定向到登录页"
                 break
-            _log(logger, f"[尝试 {attempt}/{renew_attempts}] 寻找 Renew 按钮...")
-            renew_btn = page.get_by_role("button", name="Renew", exact=True).first
-            try:
-                await renew_btn.wait_for(state="visible", timeout=5000)
-            except Exception:
-                pass
-            if not await renew_btn.is_visible():
-                result["detail"] = "未找到 Renew 按钮"
+            _log(logger, f"[尝试 {attempt}/{renew_attempts}] 寻找 Renew/Extend 按钮...")
+            renew_btn = await _find_action(page, "renew")
+            if not await _safe_click(renew_btn):
+                result["detail"] = "未找到 Renew/Extend 按钮"
                 break
-            await renew_btn.click()
             _log(logger, "Renew 已点击，等待弹框...")
-            modal = page.locator('.modal-content, [role="dialog"]').filter(has_text="Renew").first
-            try:
-                await modal.wait_for(state="visible", timeout=5000)
-            except Exception:
-                _log(logger, "弹框未出现，重试")
+            modal = None
+            modal_deadline = min(action_deadline, time.time() + 10)
+            while time.time() < modal_deadline and modal is None:
+                modal = await _find_renew_dialog(page)
+                if modal is None:
+                    await page.wait_for_timeout(500)
+            if modal is None:
+                result["detail"] = "点击 Renew 后未弹出续期框"
                 continue
-            confirm = modal.get_by_role("button", name="Renew", exact=True)
-            if not await confirm.is_visible():
+            confirm = await _find_modal_renew(modal)
+            if confirm is None:
+                result["detail"] = "续期弹框中未找到确认 Renew 按钮"
                 await page.reload()
                 await page.wait_for_timeout(3000)
                 continue
 
             await _safe_shot(page, str(shot_dir / f"{safe}_altcha_{attempt}.png"))
-            altcha_ok = await solve_altcha(page, logger, 15, 8000)
+            remaining = max(1, int(action_deadline - time.time()))
+            altcha_attempts = min(15, max(1, remaining // 8))
+            altcha_ok = await solve_altcha(page, logger, altcha_attempts, 8000)
             if not altcha_ok:
                 result["detail"] = "ALTCHA 未通过"
                 await page.reload()
                 await page.wait_for_timeout(3000)
                 continue
 
-            _log(logger, "点击弹框内 Renew 确认...")
-            await confirm.click()
-
-            captcha_err = False
-            not_yet = False
-            date_str = ""
-            t0 = time.time()
-            while time.time() - t0 < 3:
-                try:
-                    if await page.get_by_text("Please complete the captcha to continue").is_visible():
-                        captcha_err = True
-                        break
-                    not_time_loc = page.get_by_text("You can't renew your server yet")
-                    if await not_time_loc.is_visible():
-                        txt = await not_time_loc.inner_text()
-                        m = re.search(r"as of\s+(.*?)\s+\(", txt or "")
-                        date_str = m.group(1) if m else "未知"
-                        not_yet = True
-                        break
-                except Exception:
-                    pass
-                await page.wait_for_timeout(200)
-
-            if not_yet:
-                result["success"] = True
-                result["detail"] = f"暂无需续期，下次可续期：{date_str}"
-                try:
-                    close = modal.get_by_label("Close")
-                    if await close.is_visible():
-                        await close.click()
-                        await page.wait_for_timeout(500)
-                except Exception:
-                    pass
-                result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_skip.png")) or ""
-                break
-
-            if captcha_err:
-                result["detail"] = "验证码未通过"
-                await page.reload()
-                await page.wait_for_timeout(3000)
-                continue
-
+            # Android waits two seconds after the visible Verified state becomes stable.
             await page.wait_for_timeout(2000)
-            if not await modal.is_visible():
-                result["success"] = True
-                result["detail"] = "续期成功"
-                result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}_success.png")) or ""
-                break
-            else:
+            stable = await _get_altcha_status(page)
+            if stable.get("exists") and not stable.get("solved"):
+                result["detail"] = "ALTCHA 验证状态未稳定"
                 await page.reload()
                 await page.wait_for_timeout(3000)
                 continue
+
+            _log(logger, "ALTCHA 已稳定验证，点击弹框内 Renew 确认...")
+            if not await _safe_click(confirm):
+                result["detail"] = "弹框 Renew 确认点击失败"
+                await page.reload()
+                await page.wait_for_timeout(3000)
+                continue
+            result["clicked_renew"] = True
+
+            rejected = False
+            outcome_deadline = min(action_deadline, time.time() + 15)
+            while time.time() < outcome_deadline:
+                text = (await _body_text(page)).lower()
+                expiry = await _extract_expiry(page)
+                if expiry:
+                    result["expiry"] = expiry
+                if "please complete the captcha" in text:
+                    rejected = True
+                    result["clicked_renew"] = False
+                    result["detail"] = "验证码未通过，已重置状态重试"
+                    _log(logger, "验证码被服务端拒绝，重置本轮 Renew 状态")
+                    break
+                if "you can't renew your server yet" in text or "you will be able to" in text:
+                    match = re.search(r"as of\s+(.*?)\s+\(", text, re.I)
+                    date_str = match.group(1).strip() if match else "未知"
+                    result["success"] = True
+                    result["detail"] = f"续期检查完成：暂未到可续期时间（{date_str}）"
+                    break
+                if any(message in text for message in (
+                    "has been renewed", "been renewed", "server has been renewed"
+                )):
+                    result["success"] = True
+                    result["detail"] = "检测到本轮 See/Renew 后的续期成功记录"
+                    break
+                await page.wait_for_timeout(500)
+
+            if result["success"]:
+                if not (result["saw_see"] and result["clicked_renew"]):
+                    result["success"] = False
+                    result["detail"] = "未完成 See/Renew 确认"
+                else:
+                    result["screenshot"] = await _safe_shot(
+                        page, str(shot_dir / f"{safe}_success.png")
+                    ) or ""
+                    break
+            if rejected:
+                await page.reload()
+                await page.wait_for_timeout(3000)
+                continue
+            result["detail"] = "确认 Renew 后未检测到明确结果"
+            await page.reload()
+            await page.wait_for_timeout(3000)
 
         if not result["success"] and not result["detail"]:
             result["detail"] = f"续期失败（已重试 {renew_attempts} 次）"
+        if result["success"] and not (result["saw_see"] and result["clicked_renew"]):
+            result["success"] = False
+            result["detail"] = "未完成 See/Renew 确认"
+        expiry = await _extract_expiry(page)
+        if expiry:
+            result["expiry"] = expiry
         if not result["screenshot"]:
             result["screenshot"] = await _safe_shot(page, str(shot_dir / f"{safe}.png")) or ""
 
@@ -1574,7 +1785,7 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                 browser = await p.chromium.launch(**launch_kwargs)
                 _log(logger, "使用 Playwright 内置 chromium")
 
-            context = await browser.new_context(
+            context_options = dict(
                 viewport=VIEWPORT,
                 user_agent=ua,
                 locale="zh-CN",
@@ -1589,20 +1800,51 @@ async def run_all(accounts: List[Dict[str, str]], login_url: str, shot_dir: Path
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 },
             )
-            if (os.environ.get("KATABUMP_DISABLE_STEALTH") or "").strip().lower() in ("1", "true", "yes", "on"):
-                _log(logger, "正式流程未注入 STEALTH_SCRIPT（KATABUMP_DISABLE_STEALTH=1），用于对比诊断")
-            else:
-                await context.add_init_script(STEALTH_SCRIPT)
-                _log(logger, "正式流程已注入 STEALTH_SCRIPT；诊断会输出 nativeFns 判断是否误改关键原生函数")
+            disable_stealth = (os.environ.get("KATABUMP_DISABLE_STEALTH") or "").strip().lower() in (
+                "1", "true", "yes", "on"
+            )
             try:
                 for i, user in enumerate(accounts):
-                    _log(logger, f"=== 处理账号 {i+1}/{len(accounts)}: {user['username']} ===")
-                    res = await process_account(context, user, login_url or LOGIN_URL_DEFAULT,
-                                                shot_dir, logger, turnstile_wait, renew_attempts)
-                    results.append(res)
+                    display_name = user.get("name") or user.get("remark") or user["username"]
+                    _log(logger, f"=== 处理账号 {i+1}/{len(accounts)}: {display_name} ({user['username']}) ===")
+                    context = None
+                    try:
+                        # Android clears cookies/cache/history before every batch item. A new
+                        # BrowserContext provides the same isolation without stale async state.
+                        context = await browser.new_context(**context_options)
+                        if disable_stealth:
+                            _log(logger, "当前账号未注入 STEALTH_SCRIPT（KATABUMP_DISABLE_STEALTH=1）")
+                        else:
+                            await context.add_init_script(STEALTH_SCRIPT)
+                            _log(logger, "当前账号已使用全新会话并注入 STEALTH_SCRIPT")
+                        res = await process_account(
+                            context, user, login_url or LOGIN_URL_DEFAULT,
+                            shot_dir, logger, turnstile_wait, renew_attempts,
+                        )
+                        results.append(res)
+                    except Exception as e:
+                        results.append({
+                            "name": display_name,
+                            "username": user["username"],
+                            "purpose": user.get("purpose", ""),
+                            "success": False,
+                            "detail": f"账号会话异常：{e}",
+                            "expiry": "",
+                            "saw_see": False,
+                            "clicked_renew": False,
+                            "screenshot": "",
+                            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    finally:
+                        try:
+                            if context:
+                                await context.close()
+                        except Exception:
+                            pass
+                    if i + 1 < len(accounts):
+                        await asyncio.sleep(1.2)
             finally:
                 try:
-                    await context.close()
                     await browser.close()
                 except Exception:
                     pass

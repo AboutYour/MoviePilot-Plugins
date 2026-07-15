@@ -37,7 +37,7 @@ class KatabumpRenew(_PluginBase):
     plugin_name = "Katabump自动续期"
     plugin_desc = "定时登录 Katabump 免费面板，自动为服务器续期（See→Renew→过验证码→确认），结果推送到通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     plugin_author = "kbmgr"
     author_url = "https://github.com/"
     plugin_config_prefix = "katabumprenew_"
@@ -229,7 +229,7 @@ class KatabumpRenew(_PluginBase):
                                         "model": "accounts_json",
                                         "label": "账号列表 (JSON)",
                                         "rows": 6,
-                                        "placeholder": '[{"username":"a@x.com","password":"pwd1"},\n {"username":"b@x.com","password":"pwd2"}]',
+                                        "placeholder": '[{"name":"主账号","purpose":"主服务器","username":"a@x.com","password":"pwd1"},\n {"name":"备用账号","username":"b@x.com","password":"pwd2"}]',
                                     },
                                 }],
                             },
@@ -338,10 +338,9 @@ class KatabumpRenew(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "v1.4.1：新增浏览器模式，可优先尝试系统 Chrome/Edge，减少 Playwright Chromium 兼容问题。"
-                                            "1) 日志须出现「引擎 v1.4.1」。"
-                                            "2) 若继续空 iframe，优先使用 CDP 模式而不是继续调整代理。"
-                                            "3) 不建议开启无头模式。",
+                                    "text": "v1.5.0：同步 Android 一键签到逻辑。每个账号使用独立会话；支持账号备注/用途；"
+                                            "宽容定位 See/View/Manage 与 Renew/Extend；ALTCHA 稳定验证后再确认；"
+                                            "仅在本轮完成 See/Renew 后判定成功，并记录 Expiry。",
                                 },
                             }],
                         }],
@@ -379,10 +378,11 @@ class KatabumpRenew(_PluginBase):
                 "component": "tr",
                 "content": [
                     {"component": "td", "text": item.get("time", "")},
-                    {"component": "td", "text": item.get("name", "")},
+                    {"component": "td", "text": item.get("name") or item.get("username", "")},
                     {"component": "td",
                      "props": {"style": f"color:{'#4caf50' if ok else '#f44336'}"},
                      "text": "成功" if ok else "失败"},
+                    {"component": "td", "text": item.get("expiry", "") or "-"},
                     {"component": "td", "text": item.get("detail", "")},
                 ],
             })
@@ -398,6 +398,7 @@ class KatabumpRenew(_PluginBase):
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "账号"},
                             {"component": "th", "text": "结果"},
+                            {"component": "th", "text": "Expiry"},
                             {"component": "th", "text": "详情"},
                         ],
                     }]},
@@ -428,8 +429,15 @@ class KatabumpRenew(_PluginBase):
         except Exception as e:
             logger.error(f"账号 JSON 解析失败: {e}")
             return []
-        items = parsed if isinstance(parsed, list) else parsed.get("users", []) if isinstance(parsed, dict) else []
-        result, seen = [], set()
+        if isinstance(parsed, list):
+            items = parsed
+        elif isinstance(parsed, dict) and (parsed.get("username") or parsed.get("email")):
+            items = [parsed]
+        elif isinstance(parsed, dict):
+            items = parsed.get("accounts") or parsed.get("users") or []
+        else:
+            items = []
+        result = []
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -437,11 +445,43 @@ class KatabumpRenew(_PluginBase):
             p = str(it.get("password") or "").strip()
             if not u or not p:
                 continue
-            key = u.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append({"username": u, "password": p})
+            result.append({
+                "name": str(it.get("name") or it.get("remark") or "").strip(),
+                "purpose": str(it.get("purpose") or "").strip(),
+                "username": u,
+                "password": p,
+            })
+        # Android one-click fallback: when no standalone account is available, use enabled
+        # server records that contain panel credentials. This also accepts combined exports.
+        if not result:
+            if isinstance(parsed, dict):
+                server_items = parsed.get("servers") or parsed.get("Servers") or []
+            elif isinstance(parsed, list):
+                server_items = parsed
+            else:
+                server_items = []
+            for item in server_items:
+                if not isinstance(item, dict):
+                    continue
+                enabled = item.get("enabled", item.get("Enabled", True))
+                if enabled is False:
+                    continue
+                username = str(
+                    item.get("panelUsername") or item.get("PanelUsername") or
+                    item.get("panel_user") or item.get("PanelUser") or ""
+                ).strip()
+                password = str(
+                    item.get("panelPassword") or item.get("PanelPassword") or
+                    item.get("panelPasswordPlain") or item.get("PanelPasswordPlain") or ""
+                ).strip()
+                if not username or not password:
+                    continue
+                result.append({
+                    "name": str(item.get("name") or item.get("Name") or "").strip(),
+                    "purpose": str(item.get("purpose") or item.get("Purpose") or "").strip(),
+                    "username": username,
+                    "password": password,
+                })
         return result
 
     @staticmethod
@@ -491,7 +531,12 @@ class KatabumpRenew(_PluginBase):
         lines = [f"✅ 成功 {ok} / ❌ 失败 {fail} / 共 {len(results)}", "━━━━━━━━"]
         for r in results:
             icon = "✅" if r.get("success") else "❌"
-            lines.append(f"{icon} {self._mask(r.get('name',''))}：{r.get('detail','')}")
+            username = r.get("username", "")
+            display_name = r.get("name") or ""
+            masked_user = self._mask(username)
+            account_text = f"{display_name} ({masked_user})" if display_name and display_name != username else masked_user
+            expiry = f"；Expiry {r.get('expiry')}" if r.get("expiry") else ""
+            lines.append(f"{icon} {account_text}：{r.get('detail','')}{expiry}")
         lines.append("━━━━━━━━")
         lines.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.post_message(

@@ -1,0 +1,15 @@
+{
+  "nodeseeksign": {
+    "name": "NodeSeek / DeepFlood 签到",
+    "description": "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。",
+    "labels": "签到,NodeSeek,DeepFlood,多账号,论坛",
+    "version": "3.0.0",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png",
+    "author": "madrays / kbmgr",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v3.0.0": "移植插件；新增 NodeSeek/DeepFlood 双站点、多账号、独立备注与旧配置迁移支持。"
+    }
+  }
+}

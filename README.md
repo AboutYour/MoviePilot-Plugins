@@ -33,7 +33,7 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
 3. 在插件市场找到「Katabump自动续期」，点安装。
 4. 打开插件配置：
    - **启用插件**
-   - **账号列表 (JSON)**：`[{"username":"a@x.com","password":"pwd1"}, {"username":"b@x.com","password":"pwd2"}]`
+   - **账号列表 (JSON)**：`[{"name":"主账号","purpose":"主服务器","username":"a@x.com","password":"pwd1"}, {"name":"备用账号","username":"b@x.com","password":"pwd2"}]`
    - **执行周期**：默认 `30 3 */3 * *`（每 3 天凌晨 3:30）；按你的续期周期调整
    - **发送通知**：开启后每轮结束把汇总推到 MP 通知
    - 其余（Turnstile 等待、续期重试、Chrome 路径）保持默认即可
@@ -43,7 +43,7 @@ MoviePilot-Plugins/              ← 仓库根（推送到 GitHub 的内容）
 
 | 配置 | 说明 |
 |---|---|
-| 账号列表 (JSON) | 账号数组，字段 `username`/`password`，与桌面版 `login.json` 兼容 |
+| 账号列表 (JSON) | 账号数组，字段 `name`/`purpose`（可选）及 `username`/`password`，与 Android/桌面版 `login.json` 兼容；也可粘贴 Android 组合导出的 `{accounts,servers}`；没有账号时从启用服务器的面板凭据生成目标；每条记录独立执行，不按用户名去重 |
 | 执行周期 (cron) | 标准 5 段 cron，MP 本地时区 |
 | 登录地址 | 默认 `https://dashboard.katabump.com/auth/login` |
 | Turnstile 等待(秒) | 等令牌就绪的上限，默认 120；若已判定 CF 网络失败会提前结束 |
@@ -93,6 +93,7 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 
 ## 版本
 
+- **v1.5.0**：同步 Android 一键签到逻辑；账号独立会话；宽容定位 See/Renew；ALTCHA 稳定确认；严格校验本轮 See/Renew；记录 Expiry
 - **v1.3.2**：修复主域通、随机子域（brunhild.*）不通时误关 DNS 映射；直连强制 `MAP *.challenges.cloudflare.com`
 - **v1.3.0**：公共 DNS 预解析 + host-resolver-rules / DoH；读取 `PROXY_HOST`；启动打印引擎版本
 - **v1.2.0**：CF 连通性预检、代理 auto 回退、socks5h、网络失败提前结束
@@ -102,10 +103,10 @@ curl -I --max-time 10 https://challenges.cloudflare.com
 ### 如何确认已更新到最新版
 
 ```text
-[Katabump] 插件版本 1.3.2 ...
-[Katabump] ======== Katabump 引擎 v1.3.2 启动 ========
+[Katabump] 插件版本 1.5.0 ...
+[Katabump] ======== Katabump 引擎 v1.5.0 启动 ========
 [Katabump] 将 *.challenges.cloudflare.com 全部映射到 104.x.x.x
 [Katabump] 已注入 host-resolver-rules ...
 ```
 
-没有 `v1.3.2` / `host-resolver-rules` 说明未更新成功：卸载重装插件并重启 MoviePilot。
+没有 `v1.5.0` / `host-resolver-rules` 说明未更新成功：卸载重装插件并重启 MoviePilot。

@@ -41,7 +41,7 @@ class NodeSeekSignBatch(_PluginBase):
     plugin_name = "NodeSeek / DeepFlood 多账号签到"
     plugin_desc = "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "3.1.1"
+    plugin_version = "3.2.0"
     plugin_author = "madrays / kbmgr"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "nodeseeksignbatch_"
@@ -78,9 +78,11 @@ class NodeSeekSignBatch(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
     _run_lock = threading.Lock()
+    _account_clients: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
+        self._account_clients = {}
         self._enabled = False
         self._notify = True
         self._onlyonce = False
@@ -267,23 +269,30 @@ class NodeSeekSignBatch(_PluginBase):
             self._run_lock.release()
 
     def _sign_account_with_retries(self, account: Dict[str, Any]) -> Dict[str, Any]:
-        result = None
-        for attempt in range(self._max_retries + 1):
-            if attempt:
-                delay = random.uniform(max(1, self._min_delay), max(2, self._max_delay))
-                logger.info(
-                    f"NodeSeek签到：{account['remark']} 第 {attempt}/{self._max_retries} 次重试，"
-                    f"等待 {delay:.1f} 秒"
-                )
-                time.sleep(delay)
-            try:
-                result = self._sign_account(account)
-            except Exception as exc:
-                logger.error(f"NodeSeek签到：{account['remark']} 请求异常：{exc}", exc_info=True)
-                result = self._result(account, False, f"请求异常：{exc}")
-            if result.get("success"):
-                return result
-        return result or self._result(account, False, "未知错误")
+        try:
+            self._open_account_clients(account)
+            result = None
+            for attempt in range(self._max_retries + 1):
+                if attempt:
+                    delay = random.uniform(max(1, self._min_delay), max(2, self._max_delay))
+                    logger.info(
+                        f"NodeSeek签到：{account['remark']} 第 {attempt}/{self._max_retries} 次重试，"
+                        f"等待 {delay:.1f} 秒"
+                    )
+                    time.sleep(delay)
+                try:
+                    result = self._sign_account(account)
+                except Exception as exc:
+                    logger.error(f"NodeSeek签到：{account['remark']} 请求异常：{exc}", exc_info=True)
+                    result = self._result(account, False, f"请求异常：{exc}")
+                if result.get("success"):
+                    return result
+            return result or self._result(account, False, "未知错误")
+        except Exception as exc:
+            logger.error(f"NodeSeek签到：{account['remark']} 创建独立会话失败：{exc}", exc_info=True)
+            return self._result(account, False, f"创建独立会话失败：{exc}")
+        finally:
+            self._close_account_clients(account["key"])
 
     def _sign_account(self, account: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"NodeSeek签到：正在签到 {account['remark']} ({account['site_name']})")
@@ -291,6 +300,7 @@ class NodeSeekSignBatch(_PluginBase):
         headers = self._headers(account, referer="/board")
         random_param = "true" if self._random_choice else "false"
         response = self._request(
+            account,
             "post",
             f"{base_url}/api/attendance?random={random_param}",
             headers=headers,
@@ -332,40 +342,50 @@ class NodeSeekSignBatch(_PluginBase):
             "Origin": account["base_url"],
             "Referer": account["base_url"] + referer,
             "User-Agent": self.USER_AGENT,
-            "Cookie": account["cookie"],
         }
 
     @staticmethod
     def _parse_sign_response(response: Any) -> Dict[str, Any]:
         result = {"success": False, "already_signed": False, "message": ""}
+        status_code = getattr(response, "status_code", 0)
         try:
             data = response.json()
             message = str(data.get("message") or "")
-            result["message"] = message or f"HTTP {response.status_code}"
+            response_status = data.get("status") or status_code or "-"
+            result["message"] = message or f"HTTP {response_status}"
             if data.get("success") is True:
                 result.update(success=True, gain=data.get("gain"))
             elif "已完成签到" in message or "已经签到" in message or "已签到" in message:
                 result.update(success=True, already_signed=True)
             elif "鸡腿" in message or ("签到" in message and ("成功" in message or "完成" in message)):
                 result["success"] = True
-            elif message == "USER NOT FOUND" or data.get("status") == 404:
+            elif message.strip().upper() == "USER NOT FOUND":
                 result["message"] = "Cookie 已失效，请更新"
+            elif status_code == 429 or data.get("status") == 429:
+                result["message"] = "请求过于频繁，被站点限流；请增大账号间随机延迟"
+            elif status_code == 403 or data.get("status") == 403:
+                result["message"] = "请求被 Cloudflare 拦截，并非 Cookie 失效"
             return result
         except Exception:
             text = str(getattr(response, "text", "") or "")
-            if "已完成签到" in text or "已经签到" in text or "已签到" in text:
+            if status_code == 429:
+                result["message"] = "请求过于频繁，被站点限流；请增大账号间随机延迟"
+            elif status_code == 403:
+                result["message"] = "请求被 Cloudflare 拦截，并非 Cookie 失效"
+            elif "已完成签到" in text or "已经签到" in text or "已签到" in text:
                 result.update(success=True, already_signed=True, message="今日已签到")
             elif any(keyword in text for keyword in ("签到成功", "签到完成", "鸡腿")):
                 result.update(success=True, message="签到成功")
             elif any(keyword in text for keyword in ("登录", "注册", "陌生人")):
                 result["message"] = "未登录或 Cookie 已失效"
             else:
-                result["message"] = f"非 JSON 响应 (HTTP {getattr(response, 'status_code', '-')})"
+                result["message"] = f"非 JSON 响应 (HTTP {status_code or '-'})"
             return result
 
     def _fetch_attendance(self, account: Dict[str, Any]) -> Dict[str, Any]:
         try:
             response = self._request(
+                account,
                 "get",
                 f"{account['base_url']}/api/attendance/board?page=1",
                 headers=self._headers(account),
@@ -411,6 +431,7 @@ class NodeSeekSignBatch(_PluginBase):
         member_id = account["member_id"]
         try:
             response = self._request(
+                account,
                 "get",
                 f"{account['base_url']}/api/account/getInfo/{member_id}?readme=1",
                 headers=self._headers(account, referer=f"/space/{member_id}"),
@@ -455,15 +476,96 @@ class NodeSeekSignBatch(_PluginBase):
         result.update({key: value for key, value in extra.items() if value not in (None, "")})
         return result
 
-    def _request(self, method: str, url: str, headers: Dict[str, str], data: Any = None):
-        proxies = self._get_proxies()
-        verify = self._verify_ssl
-        errors = []
+    @staticmethod
+    def _cookie_pairs(cookie_header: str) -> List[Tuple[str, str]]:
+        cookie_header = str(cookie_header or "").strip()
+        if cookie_header.lower().startswith("cookie:"):
+            cookie_header = cookie_header.split(":", 1)[1].strip()
+        pairs = []
+        for part in cookie_header.replace("\r", "").replace("\n", "").split(";"):
+            name, separator, value = part.strip().partition("=")
+            if separator and name.strip():
+                pairs.append((name.strip(), value.strip()))
+        return pairs
+
+    def _seed_client_cookies(self, client: Any, account: Dict[str, Any]):
+        hostname = urlparse(account["base_url"]).hostname or ""
+        for name, value in self._cookie_pairs(account["cookie"]):
+            client.cookies.set(name, value, domain=hostname, path="/")
+
+    def _open_account_clients(self, account: Dict[str, Any]):
+        key = account["key"]
+        self._close_account_clients(key)
+        clients: Dict[str, Any] = {}
 
         if HAS_CLOUDSCRAPER:
             try:
-                scraper = cloudscraper.create_scraper(browser="chrome")
-                response = scraper.request(
+                clients["cloudscraper"] = cloudscraper.create_scraper(browser="chrome")
+            except Exception as exc:
+                logger.warning(f"NodeSeek签到：{account['remark']} 初始化 cloudscraper 失败：{exc}")
+        if HAS_CURL_CFFI:
+            try:
+                clients["curl_cffi"] = curl_requests.Session(impersonate="chrome110")
+            except Exception as exc:
+                logger.warning(f"NodeSeek签到：{account['remark']} 初始化 curl_cffi 失败：{exc}")
+        clients["requests"] = requests.Session()
+
+        for backend, client in list(clients.items()):
+            try:
+                self._seed_client_cookies(client, account)
+            except Exception as exc:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                clients.pop(backend, None)
+                logger.warning(
+                    f"NodeSeek签到：{account['remark']} 初始化 {backend} Cookie 会话失败：{exc}"
+                )
+        if "requests" not in clients:
+            for client in clients.values():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            raise RuntimeError("无法创建账号独立 HTTP 会话")
+        self._account_clients[key] = clients
+        logger.info(
+            f"NodeSeek签到：{account['remark']} 已创建独立会话 "
+            f"({len(self._cookie_pairs(account['cookie']))} 个 Cookie)"
+        )
+
+    def _close_account_clients(self, account_key: str):
+        clients = self._account_clients.pop(account_key, {})
+        for client in clients.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _close_all_account_clients(self):
+        for account_key in list(getattr(self, "_account_clients", {})):
+            self._close_account_clients(account_key)
+
+    def _request(
+        self,
+        account: Dict[str, Any],
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        data: Any = None,
+    ):
+        proxies = self._get_proxies()
+        verify = self._verify_ssl
+        errors = []
+        clients = self._account_clients.get(account["key"])
+        if not clients:
+            self._open_account_clients(account)
+            clients = self._account_clients[account["key"]]
+
+        if "cloudscraper" in clients:
+            try:
+                response = clients["cloudscraper"].request(
                     method, url, headers=headers, data=data, proxies=proxies,
                     timeout=30, verify=verify,
                 )
@@ -473,11 +575,11 @@ class NodeSeekSignBatch(_PluginBase):
             except Exception as exc:
                 errors.append(f"cloudscraper: {exc}")
 
-        if HAS_CURL_CFFI:
+        if "curl_cffi" in clients:
             try:
-                response = curl_requests.request(
+                response = clients["curl_cffi"].request(
                     method, url, headers=headers, data=data, proxies=proxies,
-                    timeout=30, verify=verify, impersonate="chrome110",
+                    timeout=30, verify=verify,
                 )
                 if self._usable_response(response):
                     return response
@@ -486,7 +588,7 @@ class NodeSeekSignBatch(_PluginBase):
                 errors.append(f"curl_cffi: {exc}")
 
         try:
-            return requests.request(
+            return clients["requests"].request(
                 method, url, headers=headers, data=data, proxies=proxies,
                 timeout=30, verify=verify,
             )
@@ -742,6 +844,8 @@ class NodeSeekSignBatch(_PluginBase):
                 self._scheduler = None
         except Exception as exc:
             logger.error(f"NodeSeek签到：停止调度失败：{exc}")
+        finally:
+            self._close_all_account_clients()
 
     def get_command(self) -> List[Dict[str, Any]]:
         return []

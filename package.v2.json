@@ -2,12 +2,13 @@
   "NodeSeekSignBatch": {
     "name": "NodeSeek / DeepFlood 多账号签到",
     "description": "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。",
-    "version": "3.2.0",
+    "version": "3.2.1",
     "level": 2,
     "author": "madrays / kbmgr",
     "authorUrl": "https://github.com/madrays",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png",
     "history": {
+      "v3.2.1": "根据实测日志优化失败处理：明确失效的 Cookie 不再重复请求；认证失败时跳过签到榜查询；签到榜兜底仅在匹配当前账号身份时生效。",
       "v3.2.0": "修复多账号批量签到会话串扰：每个账号使用独立 Cookie jar 和持久 HTTP 会话，账号内签到、查询及重试复用同一会话，完成后立即释放。",
       "v3.1.1": "刷新重命名后的 V2 安装索引；从旧版 NodeSeekSign 更新后需强制刷新插件市场或重启 MoviePilot。",
       "v3.1.0": "更换插件唯一标识为 NodeSeekSignBatch，避免与其它 nodeseeksign 插件冲突。",

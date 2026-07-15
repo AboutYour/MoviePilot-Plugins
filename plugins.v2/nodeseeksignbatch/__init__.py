@@ -41,7 +41,7 @@ class NodeSeekSignBatch(_PluginBase):
     plugin_name = "NodeSeek / DeepFlood 多账号签到"
     plugin_desc = "支持 NodeSeek、DeepFlood 多账号每日签到，每个账号独立配置备注、站点和 Cookie。"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     plugin_author = "madrays / kbmgr"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "nodeseeksignbatch_"
@@ -287,6 +287,11 @@ class NodeSeekSignBatch(_PluginBase):
                     result = self._result(account, False, f"请求异常：{exc}")
                 if result.get("success"):
                     return result
+                if result.get("retryable") is False:
+                    logger.warning(
+                        f"NodeSeek签到：{account['remark']} 为不可重试错误，停止后续重试"
+                    )
+                    return result
             return result or self._result(account, False, "未知错误")
         except Exception as exc:
             logger.error(f"NodeSeek签到：{account['remark']} 创建独立会话失败：{exc}", exc_info=True)
@@ -308,15 +313,27 @@ class NodeSeekSignBatch(_PluginBase):
         )
         api_result = self._parse_sign_response(response)
 
-        attendance = self._fetch_attendance(account)
-        if not api_result["success"] and self._attendance_is_today(attendance):
+        attendance = (
+            self._fetch_attendance(account)
+            if api_result.get("retryable", True) or api_result["success"]
+            else {}
+        )
+        if (
+            not api_result["success"]
+            and attendance.get("identity_matched") is True
+            and self._attendance_is_today(attendance)
+        ):
             api_result.update({
                 "success": True,
                 "already_signed": True,
                 "message": "今日已签到（签到记录确认）",
             })
 
-        user_info = self._fetch_user_info(account) if account.get("member_id") else {}
+        user_info = (
+            self._fetch_user_info(account)
+            if account.get("member_id") and (api_result.get("retryable", True) or api_result["success"])
+            else {}
+        )
         gain = attendance.get("gain") or api_result.get("gain")
         result = self._result(
             account,
@@ -327,6 +344,7 @@ class NodeSeekSignBatch(_PluginBase):
             rank=attendance.get("rank"),
             total_signers=attendance.get("total_signers"),
             user_name=user_info.get("member_name"),
+            retryable=api_result.get("retryable", True),
         )
         logger.info(
             f"NodeSeek签到：{account['remark']} "
@@ -346,7 +364,7 @@ class NodeSeekSignBatch(_PluginBase):
 
     @staticmethod
     def _parse_sign_response(response: Any) -> Dict[str, Any]:
-        result = {"success": False, "already_signed": False, "message": ""}
+        result = {"success": False, "already_signed": False, "retryable": True, "message": ""}
         status_code = getattr(response, "status_code", 0)
         try:
             data = response.json()
@@ -360,7 +378,7 @@ class NodeSeekSignBatch(_PluginBase):
             elif "鸡腿" in message or ("签到" in message and ("成功" in message or "完成" in message)):
                 result["success"] = True
             elif message.strip().upper() == "USER NOT FOUND":
-                result["message"] = "Cookie 已失效，请更新"
+                result.update(retryable=False, message="Cookie 已失效，请重新登录对应站点后更新")
             elif status_code == 429 or data.get("status") == 429:
                 result["message"] = "请求过于频繁，被站点限流；请增大账号间随机延迟"
             elif status_code == 403 or data.get("status") == 403:
@@ -377,7 +395,7 @@ class NodeSeekSignBatch(_PluginBase):
             elif any(keyword in text for keyword in ("签到成功", "签到完成", "鸡腿")):
                 result.update(success=True, message="签到成功")
             elif any(keyword in text for keyword in ("登录", "注册", "陌生人")):
-                result["message"] = "未登录或 Cookie 已失效"
+                result.update(retryable=False, message="未登录或 Cookie 已失效，请重新登录对应站点后更新")
             else:
                 result["message"] = f"非 JSON 响应 (HTTP {status_code or '-'})"
             return result
@@ -396,6 +414,7 @@ class NodeSeekSignBatch(_PluginBase):
                 record = dict(direct_record)
                 record["rank"] = data.get("order") or record.get("rank")
                 record["total_signers"] = data.get("total") or record.get("total_signers")
+                record["identity_matched"] = True
                 return record
             rows = data.get("data") or data.get("records") or []
             if isinstance(rows, dict):
@@ -411,7 +430,7 @@ class NodeSeekSignBatch(_PluginBase):
                 if member_id and row_member_id == member_id:
                     matched = (index, row)
                     break
-            if matched is None and rows:
+            if matched is None and rows and not member_id:
                 matched = (0, rows[0])
             if matched is None:
                 return {}
@@ -421,6 +440,7 @@ class NodeSeekSignBatch(_PluginBase):
                 "rank": row.get("rank") or index + 1,
                 "total_signers": data.get("total") or data.get("count") or len(rows),
                 "created_at": row.get("created_at") or row.get("createdAt") or row.get("time"),
+                "identity_matched": bool(member_id),
             }
             return record
         except Exception as exc:

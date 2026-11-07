@@ -35,5 +35,17 @@
       "v1.1.0": "反自动化检测 + 默认清除环境代理直连住宅出口 + 优先真实 Chrome 渠道。",
       "v1.0.0": "移植桌面版一键签到逻辑：登录过 Turnstile、See/Renew、解 ALTCHA、顺序处理多账号。"
     }
+  },
+  "GladosBatch": {
+    "name": "GLaDOS 多账号签到",
+    "description": "支持 GLaDOS 多账号每日自动签到，多个 Cookie 通过回车分隔，访问 https://glados.cloud/console/checkin 完成签到并推送通知。",
+    "version": "1.0.0",
+    "level": 1,
+    "author": "kbmgr",
+    "authorUrl": "https://github.com/AboutYour",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
+    "history": {
+      "v1.0.0": "初始版本：支持多账号 Cookie 回车分隔配置、独立会话签到、浏览器点击 button.ckb 签到模式、剩余天数与积分统计及消息通知。"
+    }
   }
 }

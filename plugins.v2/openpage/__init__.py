@@ -37,7 +37,7 @@ class OpenPage(_PluginBase):
     plugin_name = "网页批量登录签到"
     plugin_desc = "支持批量维护多个站点进行自动登录与网页签到，支持「签到地址+用户名+密码」格式维护、固定网络代理、多站点依次顺序执行及汇总通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/movie.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/AboutYour"
     plugin_config_prefix = "openpage_"
@@ -247,6 +247,15 @@ class OpenPage(_PluginBase):
         if not parts:
             return None
 
+        cookie = ""
+        # 识别凭据中是否包含 Cookie
+        for p in parts[1:]:
+            p_clean = p.strip()
+            p_lower = p_clean.lower()
+            if p_lower.startswith("cookie:") or ("=" in p_clean and ";" in p_clean) or p_lower.startswith("session="):
+                cookie = p_clean.split(":", 1)[1].strip() if p_lower.startswith("cookie:") else p_clean
+                break
+
         # 判断是否分别提供了登录地址和签到地址
         # 若 parts[0] 和 parts[1] 均为 http:// 或 https:// 开头的 URL：
         #   parts[0]: login_url, parts[1]: checkin_url, parts[2]: username, parts[3]: password
@@ -266,7 +275,11 @@ class OpenPage(_PluginBase):
         if not checkin_url:
             return None
 
-        return self._build_site_item(index, login_url, checkin_url, username, password, remark, proxy)
+        # 若用户名是 Cookie 内容，清理用户名显示避免通知和表格过长
+        if username and (cookie and (username == cookie or "cookie:" in username.lower() or ";" in username)):
+            username = ""
+
+        return self._build_site_item(index, login_url, checkin_url, username, password, remark, proxy, cookie)
 
     def _build_site_item(
         self,
@@ -277,6 +290,7 @@ class OpenPage(_PluginBase):
         password: str,
         remark: str = "",
         proxy: str = "",
+        cookie: str = "",
     ) -> Dict[str, Any]:
         # 规范化 URL
         cleaned_checkin = checkin_url.strip()
@@ -304,6 +318,7 @@ class OpenPage(_PluginBase):
             "password": password.strip(),
             "remark": remark.strip(),
             "proxy": proxy.strip(),
+            "cookie": cookie.strip(),
         }
 
     def _get_site_proxy(self, site: Dict[str, Any]) -> Optional[str]:
@@ -431,6 +446,27 @@ class OpenPage(_PluginBase):
                     )
                     page = context.new_page()
 
+                    # 0. 优先注入 Cookie（针对需要滑块/人机校验的站点，免密跳过校验）
+                    if site.get("cookie"):
+                        domain = site["hostname"]
+                        cookies = []
+                        for part in site["cookie"].split(";"):
+                            part = part.strip()
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                cookies.append({
+                                    "name": k.strip(),
+                                    "value": v.strip(),
+                                    "domain": domain if domain.startswith(".") else f".{domain}",
+                                    "path": "/",
+                                })
+                        if cookies:
+                            try:
+                                context.add_cookies(cookies)
+                                logger.info(f"网页批量签到：{site['remark']} 已注入 {len(cookies)} 个 Cookie，进行免密访问")
+                            except Exception as c_err:
+                                logger.warning(f"网页批量签到：{site['remark']} 注入 Cookie 异常：{c_err}")
+
                     # 1. 访问对应登录地址（或直接访问签到地址）
                     logger.info(f"网页批量签到：{site['remark']} 正在访问对应地址：{login_url} ...")
                     try:
@@ -443,7 +479,16 @@ class OpenPage(_PluginBase):
                     # 2. 如果页面包含账号密码输入框，执行登录
                     if username and password:
                         logged_in = self._perform_auto_login(page, username, password, site["remark"])
-                        if logged_in is False:
+                        if logged_in == "CAPTCHA":
+                            return self._result(
+                                site,
+                                success=False,
+                                status="需人机验证",
+                                message="登录界面弹出滑块/人机安全校验，无法自动破解，建议配置登录 Cookie 免密签到",
+                                retryable=False,
+                                proxy=proxy,
+                            )
+                        elif logged_in is False:
                             err_msg = self._extract_error_message(page) or "登录失败（账号或密码错误）"
                             logger.error(f"网页批量签到：{site['remark']} {err_msg}")
                             return self._result(
@@ -488,11 +533,12 @@ class OpenPage(_PluginBase):
                     click_res = self._find_and_click_checkin(page, site["remark"])
                     if click_res:
                         msg = click_res.get("message") or "已点击签到"
+                        is_captcha = click_res.get("status") == "需人机验证"
                         return self._result(
                             site,
-                            success=True,
+                            success=click_res.get("success", not is_captcha),
                             status=click_res.get("status", "成功"),
-                            message=f"已登录并打开签到地址（{msg}）",
+                            message=msg,
                             already_signed=click_res.get("already_signed", False),
                             proxy=proxy,
                         )
@@ -513,15 +559,23 @@ class OpenPage(_PluginBase):
             logger.error(f"网页批量签到：{site['remark']} Playwright 运行异常：{exc}", exc_info=True)
             return self._result(site, False, "失败", f"浏览器异常：{exc}", proxy=proxy)
 
-    def _perform_auto_login(self, page, username: str, password: str, remark: str) -> Optional[bool]:
+    def _perform_auto_login(self, page, username: str, password: str, remark: str) -> Optional[Any]:
         """
         自动探测并填充登录表单。
         返回：
           True: 成功触发登录并完成提交
           False: 检测到明确的登录错误提示
+          "CAPTCHA": 检测到弹出滑块/人机校验
           None: 页面无需登录或已登录
         """
+        # 预先检查是否已有人机验证
+        captcha_pre = self._check_captcha_or_challenge(page)
+        if captcha_pre:
+            logger.warning(f"网页批量签到：{remark} 登录前{captcha_pre}")
+            return "CAPTCHA"
+
         user_selectors = [
+            '#login-account-name',
             'input[name="username"]',
             'input[name="user"]',
             'input[name="login"]',
@@ -544,6 +598,7 @@ class OpenPage(_PluginBase):
         ]
 
         pass_selectors = [
+            '#login-account-password',
             'input[type="password"]',
             'input[name="password"]',
             'input[name="passwd"]',
@@ -565,17 +620,20 @@ class OpenPage(_PluginBase):
                 pass_input = loc
                 break
 
-        # 如果没有直接找到密码框，检查是否有“登录”链接触发登录弹窗
+        # 如果没有直接找到密码框，检查是否有“登录”链接触发登录弹窗（如 NodeLoc/Discourse）
         if not pass_input:
             login_link_selectors = [
-                'a:has-text("登录")',
+                'button.login-button',
+                'a.login-button',
+                '.login-button',
                 'button:has-text("登录")',
-                'a:has-text("登 录")',
+                'a:has-text("登录")',
                 'button:has-text("登 录")',
-                'a:has-text("Sign In")',
+                'a:has-text("登 录")',
                 'button:has-text("Sign In")',
-                'a:has-text("Log In")',
                 'button:has-text("Log In")',
+                'a:has-text("Sign In")',
+                'a:has-text("Log In")',
                 '.login-link',
                 '#login-btn',
             ]
@@ -632,6 +690,8 @@ class OpenPage(_PluginBase):
 
         # 查找登录提交按钮
         submit_selectors = [
+            '#login-button',
+            'button#login-button',
             'button[type="submit"]',
             'input[type="submit"]',
             'button:has-text("登录")',
@@ -670,6 +730,12 @@ class OpenPage(_PluginBase):
 
         page.wait_for_timeout(3000)
 
+        # 检查是否弹出滑块人机验证
+        captcha_post = self._check_captcha_or_challenge(page)
+        if captcha_post:
+            logger.warning(f"网页批量签到：{remark} 提交登录后{captcha_post}")
+            return "CAPTCHA"
+
         # 检查是否有明确错误提示
         err_msg = self._extract_error_message(page)
         if err_msg:
@@ -678,7 +744,7 @@ class OpenPage(_PluginBase):
         return True
 
     def _check_already_signed_text(self, page) -> Optional[str]:
-        """检查页面是否包含已签到关键字。"""
+        """检查页面是否包含已签到关键字或已签到状态。"""
         keywords = [
             "今日已签到",
             "今天已经签到",
@@ -697,6 +763,18 @@ class OpenPage(_PluginBase):
             if loc.count() > 0 and loc.is_visible():
                 return f"今日已签到（检测到「{kw}」）"
 
+        # 检查特殊按钮状态（如 NodeLoc checkin-button 已禁用或标题变更）
+        for sel in (
+            'button.checkin-button[title*="已签"]',
+            'button.checkin-button[aria-label*="已签"]',
+            'button.checkin-button:has-text("已签")',
+            'button.checkin-button.disabled',
+            'button.checkin-button[disabled]',
+        ):
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return f"今日已签到（按钮状态已签到）"
+
         # 检查全页文本
         try:
             content = page.content()
@@ -711,6 +789,18 @@ class OpenPage(_PluginBase):
     def _find_and_click_checkin(self, page, remark: str) -> Optional[Dict[str, Any]]:
         """寻找并点击签到按钮。"""
         checkin_selectors = [
+            'button.checkin-button',
+            'button[title="每日签到"]',
+            'button[aria-label="每日签到"]',
+            'button[title*="签到"]',
+            'button[aria-label*="签到"]',
+            'a[title*="签到"]',
+            'a[aria-label*="签到"]',
+            'button:has(svg.d-icon-calendar-heart)',
+            'button:has(use[href*="calendar-heart"])',
+            'button:has(.fa-calendar-check)',
+            'button:has(.fa-calendar)',
+            '.checkin-button',
             'button:has-text("立即签到")',
             'a:has-text("立即签到")',
             'button:has-text("今日签到")',
@@ -748,6 +838,17 @@ class OpenPage(_PluginBase):
                     loc.click(timeout=8000)
                     page.wait_for_timeout(3000)
 
+                    # 检查是否触发了人机验证/滑块
+                    captcha_info = self._check_captcha_or_challenge(page)
+                    if captcha_info:
+                        logger.warning(f"网页批量签到：{remark} 点击签到后{captcha_info}")
+                        return {
+                            "success": False,
+                            "status": "需人机验证",
+                            "message": f"点击签到后{captcha_info}，无法后台自动破解滑块挑战，建议配置登录 Cookie 免密签到",
+                            "already_signed": False,
+                        }
+
                     # 尝试捕获点击后的反馈消息（如 toast、弹窗提示）
                     feedback_msg = self._extract_feedback_message(page)
                     if feedback_msg:
@@ -765,6 +866,62 @@ class OpenPage(_PluginBase):
                     return {"success": True, "status": "成功", "message": "已点击签到按钮"}
                 except Exception as click_err:
                     logger.warning(f"网页批量签到：{remark} 点击签到按钮失败：{click_err}")
+
+        return None
+
+    def _check_captcha_or_challenge(self, page) -> Optional[str]:
+        """
+        检测页面是否弹出人机验证/滑块验证码。
+        遵守安全策略：严禁自动破解或滑动人机验证挑战。
+        """
+        captcha_selectors = [
+            ".geetest_holder",
+            ".geetest_slider",
+            ".geetest_popup",
+            ".geetest_radar",
+            ".geetest_window",
+            "#tcaptcha_transform",
+            "#tcaptcha_iframe",
+            ".tcaptcha-box",
+            ".slider-verify",
+            ".slide-verify",
+            ".nc_scale",
+            "#nc_1_wrapper",
+            "iframe[src*='challenges.cloudflare.com']",
+            ".cf-turnstile",
+            ".vaptcha-container",
+            "div[class*='slider-btn' i]",
+            "div[class*='slide-btn' i]",
+            "div[class*='captcha-modal' i]",
+            "div[id*='captcha' i]",
+        ]
+
+        for sel in captcha_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    return f"检测到弹出人机安全校验（{sel}）"
+            except Exception:
+                pass
+
+        captcha_keywords = [
+            "滑动滑块",
+            "拖动滑块",
+            "按住滑块",
+            "拖动滑块完成验证",
+            "请完成安全验证",
+            "人机验证",
+            "智能验证",
+            "Slide to verify",
+            "Security verification",
+        ]
+        for kw in captcha_keywords:
+            try:
+                loc = page.locator(f':text("{kw}")').first
+                if loc.count() > 0 and loc.is_visible():
+                    return f"检测到滑块人机验证提示（{kw}）"
+            except Exception:
+                pass
 
         return None
 
@@ -824,6 +981,8 @@ class OpenPage(_PluginBase):
 
         session = requests.Session()
         session.headers.update(headers)
+        if site.get("cookie"):
+            session.headers["Cookie"] = site["cookie"]
         if proxies:
             session.proxies.update(proxies)
 
@@ -888,6 +1047,7 @@ class OpenPage(_PluginBase):
             "status": status,
             "message": str(message or "").strip(),
             "proxy": proxy or "直连",
+            "cookie": site.get("cookie", ""),
             "retryable": retryable,
         }
 
@@ -925,13 +1085,23 @@ class OpenPage(_PluginBase):
 
         lines = []
         for r in results:
-            icon = "✅" if r.get("success") else "❌"
+            if r.get("status") == "需人机验证":
+                icon = "⚠️"
+            elif r.get("success"):
+                icon = "✅"
+            else:
+                icon = "❌"
             if r.get("already_signed"):
                 icon = "ℹ️"
 
             remark = r.get("remark")
             user = r.get("username")
-            user_label = f"({user})" if user else ""
+            if user:
+                user_label = f"({user})"
+            elif r.get("cookie"):
+                user_label = "(Cookie免密)"
+            else:
+                user_label = ""
             status = r.get("status")
             msg = r.get("message")
             proxy_label = f" [{r.get('proxy')}]" if r.get("proxy") and r.get("proxy") != "直连" else ""
@@ -1106,6 +1276,14 @@ class OpenPage(_PluginBase):
         )
         rows = []
         for item in history:
+            status = item.get("status", "未知")
+            if item.get("success"):
+                chip_color = "success"
+            elif status == "需人机验证":
+                chip_color = "warning"
+            else:
+                chip_color = "error"
+
             rows.append({
                 "component": "tr",
                 "content": [
@@ -1120,9 +1298,9 @@ class OpenPage(_PluginBase):
                             "props": {
                                 "size": "small",
                                 "variant": "outlined",
-                                "color": "success" if item.get("success") else "error",
+                                "color": chip_color,
                             },
-                            "text": item.get("status", "未知"),
+                            "text": status,
                         }],
                     },
                     {"component": "td", "text": item.get("message", "-")},

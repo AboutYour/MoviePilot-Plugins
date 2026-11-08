@@ -89,12 +89,13 @@
   "OpenPage": {
     "name": "网页批量登录签到",
     "description": "支持批量维护多个站点进行自动登录与网页签到，支持「签到地址+用户名+密码」配置、固定网络代理、多站点依次顺序执行及汇总通知。",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "level": 1,
     "author": "kbmgr",
     "authorUrl": "https://github.com/AboutYour",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/movie.png",
     "history": {
+      "v1.0.1": "适配页面直接打开自动签到（如 NextBuf）、Discourse/NodeLoc 每日签到按钮点击与弹窗登录，新增滑块/人机校验识别与 Cookie 免密注入模式。",
       "v1.0.0": "初始版本：支持批量维护多站点「签到地址+用户名+密码」、固定网络代理维护、多站点依次顺序执行、智能识别登录与签到按钮、全部完成后统一发送汇总通知与历史记录。"
     }
   }

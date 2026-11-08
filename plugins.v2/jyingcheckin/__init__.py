@@ -442,8 +442,24 @@ class JYingCheckIn(_PluginBase):
                 timeout=20,
             )
             if stats_resp.status_code == 401:
-                logger.error(f"聚影签到：{account['remark']} 认证失败，Cookie 可能已过期")
-                return self._result(account, False, "未登录或 Cookie 已失效(401)", retryable=False)
+                # 尝试通过已配置的账号密码重新自动登录
+                if account.get("username") and account.get("password") and self._login_account(account):
+                    stats_headers = self._api_headers(account)
+                    stats_resp = self._request(
+                        account,
+                        "get",
+                        self.STATS_API_URL,
+                        headers=stats_headers,
+                        timeout=20,
+                    )
+                else:
+                    err_msg = "登录已失效，请重新登录"
+                    try:
+                        err_msg = stats_resp.json().get("message") or err_msg
+                    except Exception:
+                        pass
+                    logger.error(f"聚影签到：{account['remark']} 认证失败：{err_msg}（可直接在配置中输入 账号#密码 开启自动登录）")
+                    return self._result(account, False, f"认证失败：{err_msg}(401)", retryable=False)
             
             if stats_resp.status_code == 200:
                 stats_json = stats_resp.json()
@@ -485,7 +501,13 @@ class JYingCheckIn(_PluginBase):
             return self._result(account, False, f"网络请求失败：{exc}")
 
         if resp.status_code == 401:
-            return self._result(account, False, "未登录或 Cookie 已失效(401)", retryable=False)
+            err_msg = "登录已失效，请重新登录"
+            try:
+                err_msg = resp.json().get("message") or err_msg
+            except Exception:
+                pass
+            logger.error(f"聚影签到：{account['remark']} 签到认证失败：{err_msg}")
+            return self._result(account, False, f"认证失败：{err_msg}(401)", retryable=False)
 
         try:
             data = resp.json()
@@ -705,7 +727,7 @@ class JYingCheckIn(_PluginBase):
     def _request(self, account: Dict[str, Any], method: str, url: str, **kwargs):
         clients = self._account_clients.get(account["key"]) or {}
         errors = []
-        for name in ("curl_session", "scraper", "session"):
+        for name in ("session", "scraper", "curl_session"):
             client = clients.get(name)
             if client is None:
                 continue

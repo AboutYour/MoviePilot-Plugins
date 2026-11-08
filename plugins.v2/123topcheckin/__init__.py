@@ -693,7 +693,7 @@ class Top123CheckIn(_PluginBase):
         if not self._enabled:
             return []
         return [{
-            "id": "123topcheckin",
+            "id": "Top123CheckIn",
             "name": "123云盘臻藏阁每日签到",
             "trigger": CronTrigger.from_crontab(self._cron, timezone=settings.TZ),
             "func": self.sign,

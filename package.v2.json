@@ -60,7 +60,7 @@
       "v1.0.0": "初始版本：支持聚影 (https://www.jying.top/checkin) 多账号 Cookie 批量签到、API直连/浏览器点击「立即签到」双模式、历史记录与汇总通知。"
     }
   },
-  "123topcheckin": {
+  "Top123CheckIn": {
     "name": "123云盘臻藏阁每日签到",
     "description": "支持 123云盘臻藏阁 (123.qsxy.top) 每日自动签到，自动点击用户中心抽屉并触发签到，支持多账号、签到历史与通知。",
     "version": "1.0.0",

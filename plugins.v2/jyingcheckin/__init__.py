@@ -52,6 +52,7 @@ class JYingCheckIn(_PluginBase):
     CHECKIN_PAGE_URL = "https://www.jying.top/checkin"
     STATS_API_URL = "https://www.jying.top/api/app/checkin/stats/"
     CHECKIN_API_URL = "https://www.jying.top/api/app/checkin/do/"
+    LOGIN_API_URL = "https://www.jying.top/api/app/login/"
     CHECKIN_BUTTON_SELECTOR = 'button[data-v-b974fb4e], button.n-button:has-text("立即签到")'
 
     USER_AGENT = (
@@ -195,6 +196,8 @@ class JYingCheckIn(_PluginBase):
 
             remark = ""
             cookie = line
+            username = ""
+            password = ""
 
             if line.startswith("{") and line.endswith("}"):
                 try:
@@ -203,6 +206,8 @@ class JYingCheckIn(_PluginBase):
                         continue
                     cookie = str(obj.get("cookie") or obj.get("token") or obj.get("app_user_token") or "").strip()
                     remark = str(obj.get("remark") or obj.get("name") or "").strip()
+                    username = str(obj.get("username") or obj.get("user") or "").strip()
+                    password = str(obj.get("password") or obj.get("pwd") or "").strip()
                 except Exception:
                     cookie = line
             elif "#" in line and "=" in line.split("#", 1)[1] and "=" not in line.split("#", 1)[0]:
@@ -210,10 +215,24 @@ class JYingCheckIn(_PluginBase):
             elif "|" in line and "=" in line.split("|", 1)[1] and "=" not in line.split("|", 1)[0]:
                 remark, cookie = [part.strip() for part in line.split("|", 1)]
             elif "#" in line and "=" not in line:
-                remark, cookie = [part.strip() for part in line.split("#", 1)]
+                parts = [part.strip() for part in line.split("#") if part.strip()]
+                if len(parts) == 3:
+                    remark, username, password = parts
+                elif len(parts) == 2:
+                    username, password = parts
+            elif ":" in line and "=" not in line and ";" not in line:
+                parts = [part.strip() for part in line.split(":", 1) if part.strip()]
+                if len(parts) == 2:
+                    username, password = parts
 
             if cookie.lower().startswith("cookie:"):
                 cookie = cookie.split(":", 1)[1].strip()
+
+            # 提取 username 与 password（如果写在键值对中，如 username=xxx; password=yyy;）
+            if not username:
+                username = self._extract_cookie_val(cookie, "username") or self._extract_cookie_val(cookie, "user")
+            if not password:
+                password = self._extract_cookie_val(cookie, "password") or self._extract_cookie_val(cookie, "pwd")
 
             # 提取 csrftoken 与 app_user_token
             csrftoken = self._extract_cookie_val(cookie, "csrftoken")
@@ -225,23 +244,28 @@ class JYingCheckIn(_PluginBase):
             )
 
             # 如果用户直接粘贴了纯 Token 字符串（无 '=' 且长度 >= 20）
-            if not app_user_token and "=" not in cookie and len(cookie) >= 20:
+            if not app_user_token and not username and "=" not in cookie and len(cookie) >= 20:
                 app_user_token = cookie.strip()
                 cookie = f"app_user_token={app_user_token};"
 
             pairs = self._cookie_pairs(cookie)
-            if not pairs and not app_user_token:
+            if not pairs and not app_user_token and not (username and password):
                 logger.warning(f"聚影签到：第 {idx} 行凭证格式无效，已跳过")
                 continue
 
             account_index = len(accounts) + 1
             if not remark:
-                remark = f"聚影账号{account_index}"
+                if username:
+                    remark = f"聚影账号{account_index}({username})"
+                else:
+                    remark = f"聚影账号{account_index}"
 
             accounts.append({
                 "key": f"jying:{account_index}",
                 "index": account_index,
                 "remark": remark,
+                "username": username,
+                "password": password,
                 "csrftoken": csrftoken,
                 "app_user_token": app_user_token,
                 "cookie": cookie,
@@ -321,11 +345,64 @@ class JYingCheckIn(_PluginBase):
         except Exception:
             pass
 
+    def _login_account(self, account: Dict[str, Any]) -> bool:
+        username = account.get("username")
+        password = account.get("password")
+        if not username or not password:
+            return False
+
+        logger.info(f"聚影签到：{account['remark']} 正在使用账号密码自动登录...")
+        self._ensure_csrftoken(account)
+        headers = {
+            "User-Agent": self.USER_AGENT,
+            "Referer": "https://www.jying.top/login",
+            "Origin": self.BASE_URL,
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if account.get("csrftoken"):
+            headers["X-CSRFToken"] = account["csrftoken"]
+
+        try:
+            resp = self._request(
+                account,
+                "post",
+                self.LOGIN_API_URL,
+                headers=headers,
+                json={"username": username, "password": password},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("token") or (data.get("user") or {}).get("token")
+                if token:
+                    account["app_user_token"] = token
+                    logger.info(f"聚影签到：{account['remark']} 自动登录成功，已获取 Token")
+                    return True
+                logger.warning(f"聚影签到：{account['remark']} 登录响应无 token：{data}")
+            else:
+                try:
+                    err_msg = resp.json().get("message")
+                except Exception:
+                    err_msg = resp.text[:100]
+                logger.error(f"聚影签到：{account['remark']} 登录失败({resp.status_code})：{err_msg}")
+        except Exception as exc:
+            logger.error(f"聚影签到：{account['remark']} 登录请求异常：{exc}")
+        return False
+
     def _sign_account(self, account: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"聚影签到：正在签到 {account['remark']}")
 
         # 补全 csrftoken（如未手动提供）
         self._ensure_csrftoken(account)
+
+        # 如果未提供 token 但提供了账号和密码，先自动登录获取 token
+        if not account.get("app_user_token") and account.get("username") and account.get("password"):
+            if not self._login_account(account):
+                return self._result(account, False, "账号密码自动登录失败", retryable=False)
+
+        if not account.get("app_user_token") and not account.get("cookie"):
+            return self._result(account, False, "未配置有效的 app_user_token 或账号密码", retryable=False)
 
         if self._use_browser:
             browser_result = self._sign_via_playwright(account)
@@ -755,14 +832,14 @@ class JYingCheckIn(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         example = (
-            "# 【必填】聚影使用 app_user_token 作为用户登录凭证：\n"
-            "# 获取方法：登录 jying.top 后按 F12 ->「应用」(Application) ->「本地存储空间」(Local Storage) -> 点击 https://www.jying.top -> 复制 app_user_token 的值\n\n"
-            "# 填写示例 1（直接填 Token）：\n"
+            "# 【推荐方式 1】直接填聚影的用户名与密码（插件全自动登录+签到）：\n"
+            "你的用户名#你的密码\n"
+            "# 示例：带备注\n"
+            "主账号#user1#pass123\n\n"
+            "# 【方式 2】填 Token（在浏览器控制台执行 console.log(localStorage.getItem('app_user_token'))）：\n"
             "app_user_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...;\n\n"
-            "# 填写示例 2（完整凭证）：\n"
-            "app_user_token=eyJhbGci...; csrftoken=43s2HQnUr6DifCdxtDk0C9zF1mtGEErG;\n\n"
-            "# 填写示例 3（带备注）：\n"
-            "我的聚影账号#app_user_token=eyJhbGci...;"
+            "# 【方式 3】完整 Cookie 凭据：\n"
+            "app_user_token=eyJhbGci...; csrftoken=43s2HQnUr6DifCdxtDk0C9zF1mtGEErG;"
         )
         return [{
             "component": "VForm",

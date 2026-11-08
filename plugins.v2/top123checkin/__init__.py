@@ -65,7 +65,7 @@ class Top123CheckIn(_PluginBase):
     _cron = "20 8 * * *"
     _cookies_text = ""
     _use_browser = True  # 网站有 BTWAF 盾及抽屉弹窗，默认推荐使用浏览器
-    _use_proxy = True
+    _use_proxy = False  # 国内站点，默认直连，避免被境外代理/宝塔防火墙阻断
     _verify_ssl = False
     _max_retries = 3
     _min_delay = 3
@@ -87,7 +87,7 @@ class Top123CheckIn(_PluginBase):
         self._cron = "20 8 * * *"
         self._cookies_text = ""
         self._use_browser = True
-        self._use_proxy = True
+        self._use_proxy = False
         self._verify_ssl = False
         self._max_retries = 3
         self._min_delay = 3
@@ -107,7 +107,7 @@ class Top123CheckIn(_PluginBase):
                 or ""
             ).strip()
             self._use_browser = bool(config.get("use_browser", True))
-            self._use_proxy = bool(config.get("use_proxy", True))
+            self._use_proxy = bool(config.get("use_proxy", False))
             self._verify_ssl = bool(config.get("verify_ssl", False))
             self._max_retries = self._as_int(config.get("max_retries"), 3, 0, 10)
             self._min_delay = self._as_int(config.get("min_delay"), 3, 0, 300)
@@ -373,6 +373,7 @@ class Top123CheckIn(_PluginBase):
         1. 打开 https://123.qsxy.top/
         2. 点击 <svg data-viewbox="50 0 924 924"> 用户图标展开个人中心
         3. 点击 <a class="initiate-checkin" form-action="user_checkin"> 签到按钮
+        支持代理被断开连接时自动回退为直连重试。
         """
         try:
             from playwright.sync_api import sync_playwright
@@ -380,120 +381,143 @@ class Top123CheckIn(_PluginBase):
             logger.warning(f"123云盘臻藏阁签到：未安装 Playwright 或不可用：{exc}")
             return None
 
-        try:
-            with sync_playwright() as p:
-                launch_kwargs: Dict[str, Any] = {"headless": True}
-                proxies = self._get_proxies()
-                if proxies:
-                    proxy_server = proxies.get("http") or proxies.get("https")
-                    if isinstance(proxy_server, str) and proxy_server.strip():
-                        launch_kwargs["proxy"] = {"server": proxy_server.strip()}
+        proxies = self._get_proxies()
+        initial_proxy = None
+        if proxies:
+            srv = proxies.get("http") or proxies.get("https")
+            if isinstance(srv, str) and srv.strip():
+                initial_proxy = srv.strip()
 
-                browser = p.chromium.launch(**launch_kwargs)
-                try:
-                    context = browser.new_context(
-                        user_agent=self.USER_AGENT,
-                        ignore_https_errors=not self._verify_ssl,
-                    )
-                    cookies = [
-                        {
-                            "name": name,
-                            "value": value,
-                            "domain": ".qsxy.top",
-                            "path": "/",
-                        }
-                        for name, value in self._cookie_pairs(account["cookie"])
-                    ]
-                    context.add_cookies(cookies)
+        # 尝试列表：如果配了代理，先走代理；失败后自动 fallback 直连；没配代理则直接直连
+        attempts = [initial_proxy]
+        if initial_proxy is not None:
+            attempts.append(None)
 
-                    page = context.new_page()
-
-                    intercepted_payload: Dict[str, Any] = {}
-
-                    def _on_response(resp):
-                        try:
-                            if any(k in resp.url for k in ("user_checkin", "userCheckIn", "admin-ajax")):
-                                data = resp.json()
-                                if isinstance(data, dict):
-                                    intercepted_payload.update(data)
-                        except Exception:
-                            pass
-
-                    page.on("response", _on_response)
-                    logger.info(f"123云盘臻藏阁签到：{account['remark']} 正在打开网页...")
-                    page.goto(self.CHECKIN_PAGE_URL, wait_until="networkidle", timeout=35000)
-
-                    # 第一步：点击用户图标展开抽屉/菜单
-                    # 匹配用户指定的 SVG：<svg class="icon" aria-hidden="true" data-viewbox="50 0 924 924" viewBox="50 0 924 924"><use xlink:href="#icon-user"></use></svg>
-                    logger.info(f"123云盘臻藏阁签到：{account['remark']} 正在寻找用户图标...")
-                    user_icon = page.locator('svg:has(use[*|href*="icon-user"])').first
-                    if user_icon.count() == 0:
-                        user_icon = page.locator('svg[data-viewbox="50 0 924 924"]').first
-                    if user_icon.count() == 0:
-                        user_icon = page.locator('[data-viewbox="50 0 924 924"]').first
-
-                    if user_icon.count() > 0:
-                        try:
-                            # 尝试点击该用户图标或者其父级 a/button
-                            user_icon.click(timeout=8000)
-                            page.wait_for_timeout(1500)
-                        except Exception as e:
-                            logger.info(f"直接点击 svg 提示 {e}，尝试使用 JS 触发点击")
-                            page.evaluate("""
-                                const svg = document.querySelector('svg use[href*="icon-user"], svg use[*|href*="icon-user"], svg[data-viewbox="50 0 924 924"]');
-                                if (svg) {
-                                    const target = svg.closest('a, button, div') || svg;
-                                    target.click();
-                                }
-                            """)
-                            page.wait_for_timeout(1500)
+        for proxy_server in attempts:
+            try:
+                with sync_playwright() as p:
+                    launch_kwargs: Dict[str, Any] = {
+                        "headless": True,
+                        "args": [
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-blink-features=AutomationControlled",
+                            "--ignore-certificate-errors",
+                        ],
+                    }
+                    if proxy_server:
+                        launch_kwargs["proxy"] = {"server": proxy_server}
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 使用代理启动浏览器")
                     else:
-                        logger.warning(f"123云盘臻藏阁签到：{account['remark']} 未直接找到用户图标 SVG，尝试直接查找签到按钮")
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 直连模式启动浏览器")
 
-                    # 第二步：定位签到按钮
-                    # <a class="but block c-yellow initiate-checkin" href="javascript:;" form-action="user_checkin" ...>
-                    btn = page.locator('a.initiate-checkin').first
-                    if btn.count() == 0:
-                        btn = page.locator('a[form-action="user_checkin"]').first
-                    if btn.count() == 0:
-                        btn = page.locator('a:has-text("签到领取今日奖励")').first
-                    if btn.count() == 0:
-                        btn = page.locator('a:has-text("今日已签到")').first
-
-                    if btn.count() == 0:
-                        logger.warning(f"123云盘臻藏阁签到：{account['remark']} 展开菜单后未找到签到按钮")
-                        return None
-
-                    # 检查按钮是否已经显示已签到
-                    btn_text = btn.inner_text() or ""
-                    btn_html = btn.evaluate("el => el.outerHTML") or ""
-                    if "今日已签到" in btn_text or "今日已签到" in btn_html:
-                        return self._result(
-                            account,
-                            True,
-                            "今日已签到",
-                            already_signed=True,
+                    browser = p.chromium.launch(**launch_kwargs)
+                    try:
+                        context = browser.new_context(
+                            user_agent=self.USER_AGENT,
+                            ignore_https_errors=True,
                         )
+                        cookies = [
+                            {
+                                "name": name,
+                                "value": value,
+                                "domain": ".qsxy.top",
+                                "path": "/",
+                            }
+                            for name, value in self._cookie_pairs(account["cookie"])
+                        ]
+                        context.add_cookies(cookies)
 
-                    logger.info(f"123云盘臻藏阁签到：{account['remark']} 找到签到按钮，正在点击...")
-                    btn.click(timeout=10000)
-                    page.wait_for_timeout(3000)
+                        page = context.new_page()
 
-                    # 检查拦截到的 API 响应
-                    if intercepted_payload:
-                        return self._parse_api_response(account, intercepted_payload)
+                        intercepted_payload: Dict[str, Any] = {}
 
-                    # 检查页面是否有更新提示
-                    after_html = page.content()
-                    if "今日已签到" in after_html or "签到成功" in after_html:
-                        return self._result(account, True, "签到成功 (页面已更新)")
+                        def _on_response(resp):
+                            try:
+                                if any(k in resp.url for k in ("user_checkin", "userCheckIn", "admin-ajax")):
+                                    data = resp.json()
+                                    if isinstance(data, dict):
+                                        intercepted_payload.update(data)
+                            except Exception:
+                                pass
 
-                    return self._result(account, True, "已点击签到按钮")
-                finally:
-                    browser.close()
-        except Exception as exc:
-            logger.warning(f"123云盘臻藏阁签到：{account['remark']} 浏览器签到流程异常：{exc}")
-            return None
+                        page.on("response", _on_response)
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 正在打开网页...")
+                        page.goto(self.CHECKIN_PAGE_URL, wait_until="domcontentloaded", timeout=40000)
+                        page.wait_for_timeout(2500)
+
+                        # 第一步：点击用户图标展开抽屉/菜单
+                        # 匹配用户指定的 SVG：<svg class="icon" aria-hidden="true" data-viewbox="50 0 924 924" viewBox="50 0 924 924"><use xlink:href="#icon-user"></use></svg>
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 正在寻找用户图标...")
+                        user_icon = page.locator('svg:has(use[*|href*="icon-user"])').first
+                        if user_icon.count() == 0:
+                            user_icon = page.locator('svg[data-viewbox="50 0 924 924"]').first
+                        if user_icon.count() == 0:
+                            user_icon = page.locator('[data-viewbox="50 0 924 924"]').first
+
+                        if user_icon.count() > 0:
+                            try:
+                                user_icon.click(timeout=8000)
+                                page.wait_for_timeout(1500)
+                            except Exception as e:
+                                logger.info(f"直接点击 svg 提示 {e}，尝试使用 JS 触发点击")
+                                page.evaluate("""
+                                    const svg = document.querySelector('svg use[href*="icon-user"], svg use[*|href*="icon-user"], svg[data-viewbox="50 0 924 924"]');
+                                    if (svg) {
+                                        const target = svg.closest('a, button, div') || svg;
+                                        target.click();
+                                    }
+                                """)
+                                page.wait_for_timeout(1500)
+                        else:
+                            logger.warning(f"123云盘臻藏阁签到：{account['remark']} 未直接找到用户图标 SVG，尝试直接查找签到按钮")
+
+                        # 第二步：定位签到按钮
+                        btn = page.locator('a.initiate-checkin').first
+                        if btn.count() == 0:
+                            btn = page.locator('a[form-action="user_checkin"]').first
+                        if btn.count() == 0:
+                            btn = page.locator('a:has-text("签到领取今日奖励")').first
+                        if btn.count() == 0:
+                            btn = page.locator('a:has-text("今日已签到")').first
+
+                        if btn.count() == 0:
+                            logger.warning(f"123云盘臻藏阁签到：{account['remark']} 展开菜单后未找到签到按钮")
+                            return None
+
+                        # 检查按钮是否已经显示已签到
+                        btn_text = btn.inner_text() or ""
+                        btn_html = btn.evaluate("el => el.outerHTML") or ""
+                        if "今日已签到" in btn_text or "今日已签到" in btn_html:
+                            return self._result(
+                                account,
+                                True,
+                                "今日已签到",
+                                already_signed=True,
+                            )
+
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 找到签到按钮，正在点击...")
+                        btn.click(timeout=10000)
+                        page.wait_for_timeout(3000)
+
+                        if intercepted_payload:
+                            return self._parse_api_response(account, intercepted_payload)
+
+                        after_html = page.content()
+                        if "今日已签到" in after_html or "签到成功" in after_html:
+                            return self._result(account, True, "签到成功 (页面已更新)")
+
+                        return self._result(account, True, "已点击签到按钮")
+                    finally:
+                        browser.close()
+            except Exception as exc:
+                err_str = str(exc)
+                if proxy_server and any(k in err_str for k in ("ERR_CONNECTION_CLOSED", "ERR_PROXY", "ERR_TUNNEL", "timeout", "closed")):
+                    logger.warning(f"123云盘臻藏阁签到：代理模式网络异常({exc})，自动切换为直连模式重试...")
+                    continue
+                logger.warning(f"123云盘臻藏阁签到：{account['remark']} 浏览器签到流程异常：{exc}")
+                return None
+        return None
 
     def _open_account_clients(self, account: Dict[str, Any]):
         key = account["key"]
@@ -757,7 +781,7 @@ class Top123CheckIn(_PluginBase):
                         "text": (
                             "支持 123云盘臻藏阁 (https://123.qsxy.top/) 每日自动签到。\n"
                             "多个账号请用回车换行分隔（每行一个完整 Cookie）。\n"
-                            "推荐开启浏览器自动化点击：插件将自动访问网站，点击右上角用户图标唤出个人抽屉，并点击「签到领取今日奖励」按钮。"
+                            "注意：123.qsxy.top 为国内站点，建议关闭「使用系统代理」（直连访问），避免被宝塔防火墙切断连接 (ERR_CONNECTION_CLOSED)。"
                         ),
                     },
                 },
@@ -769,7 +793,7 @@ class Top123CheckIn(_PluginBase):
             "cron": "20 8 * * *",
             "cookies_text": "",
             "use_browser": True,
-            "use_proxy": True,
+            "use_proxy": False,
             "verify_ssl": False,
             "max_retries": 3,
             "min_delay": 3,

@@ -243,10 +243,29 @@ class JYingCheckIn(_PluginBase):
                 or self._extract_cookie_val(cookie, "access_token")
             )
 
-            # 如果用户直接粘贴了纯 Token 字符串（无 '=' 且长度 >= 20）
-            if not app_user_token and not username and "=" not in cookie and len(cookie) >= 20:
-                app_user_token = cookie.strip()
-                cookie = f"app_user_token={app_user_token};"
+            # 智能纠偏：如果 username 或 password 实际被误填成了 Token（以 eyJ 开头或长 Base64 字符串）
+            if username and (username.startswith("eyJ") or len(username) >= 30):
+                if not app_user_token:
+                    app_user_token = username
+                username = ""
+            if password and (password.startswith("eyJ") or len(password) >= 30):
+                if not app_user_token:
+                    app_user_token = password
+                password = ""
+
+            # 如果用户直接粘贴了纯 Token 字符串（包含 eyJ 或长字符串）
+            if not app_user_token:
+                if "eyJ" in cookie:
+                    for part in cookie.split(";"):
+                        part = part.strip()
+                        if "eyJ" in part:
+                            app_user_token = part.split("=", 1)[-1].strip()
+                            break
+                elif "=" not in cookie and len(cookie) >= 20:
+                    app_user_token = cookie.strip()
+
+            if app_user_token and "app_user_token" not in cookie:
+                cookie = f"app_user_token={app_user_token}; {cookie}".strip()
 
             pairs = self._cookie_pairs(cookie)
             if not pairs and not app_user_token and not (username and password):
@@ -257,6 +276,9 @@ class JYingCheckIn(_PluginBase):
             if not remark:
                 if username:
                     remark = f"聚影账号{account_index}({username})"
+                elif app_user_token:
+                    # 避免把长 Token 打进 remark
+                    remark = f"聚影账号{account_index}(Token)"
                 else:
                     remark = f"聚影账号{account_index}"
 

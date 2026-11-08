@@ -312,42 +312,23 @@ class Top123CheckIn(_PluginBase):
 
     def _prepare_account_cookies(self, account: Dict[str, Any]) -> str:
         """
-        预热会话并自动补全宝塔防火墙 (BTWAF) Cookie 与基础会话 Cookie
+        处理 Cookie 并自动根据当前 User-Agent 重新计算宝塔防火墙 (BTWAF) Cookie。
+        严格保留用户原始的 PHPSESSID 与认证凭据，避免因请求首页刷新游客会话而失效。
         """
         cookie_str = account.get("cookie", "")
         pairs = dict(self._cookie_pairs(cookie_str))
 
-        # 尝试访问首页获取最新的会话 Cookie 与 BTWAF 盾
-        headers = {
-            "User-Agent": self.USER_AGENT,
-            "Referer": self.CHECKIN_PAGE_URL,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        try:
-            resp = self._request(account, "get", self.CHECKIN_PAGE_URL, headers=headers, timeout=15)
-            body = getattr(resp, "text", "") or ""
-            # 1. 检查是否有 BTWAF 盾
-            match = re.search(r'(btwaf-[a-f0-9]+-[a-f0-9]+)', body)
-            if match:
-                c_name = match.group(1)
-                c_val = hashlib.sha256(self.USER_AGENT.encode("utf-8")).hexdigest()
-                pairs[c_name] = c_val
-                logger.info(f"123云盘臻藏阁签到：{account['remark']} 自动识别并计算 BTWAF 防火墙验证 ({c_name})")
+        # 动态计算与当前 USER_AGENT 匹配的 BTWAF 校验值
+        target_btwaf = hashlib.sha256(self.USER_AGENT.encode("utf-8")).hexdigest()
+        has_btwaf = False
+        for k in list(pairs.keys()):
+            if k.startswith("btwaf-"):
+                pairs[k] = target_btwaf
+                has_btwaf = True
 
-            # 2. 同步响应中的 Set-Cookie
-            if hasattr(resp, "cookies"):
-                for k, v in resp.cookies.items():
-                    if k not in pairs or not pairs[k]:
-                        pairs[k] = v
-        except Exception as exc:
-            logger.debug(f"123云盘臻藏阁签到：{account['remark']} 预热请求失败：{exc}")
+        if not has_btwaf:
+            pairs["btwaf-21cb7f37099ce405e82768674d54a499-0711fc5487872cd6"] = target_btwaf
 
-        # 如果没有识别出 btwaf，但已知该站常用盾格式，注入预置校验
-        if not any(k.startswith("btwaf-") for k in pairs):
-            c_val = hashlib.sha256(self.USER_AGENT.encode("utf-8")).hexdigest()
-            pairs["btwaf-21cb7f37099ce405e82768674d54a499-0711fc5487872cd6"] = c_val
-
-        # 重新组合完整的 Cookie 字符串
         final_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
         account["full_cookie"] = final_cookie
         return final_cookie
@@ -472,7 +453,15 @@ class Top123CheckIn(_PluginBase):
             return self._result(account, True, "签到完成")
         error = data.get("error")
         msg = str(data.get("msg") or data.get("message") or "")
-        credit = data.get("points") or data.get("credit") or data.get("gold") or data.get("num")
+        inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+        credit = (
+            data.get("points")
+            or data.get("credit")
+            or data.get("gold")
+            or data.get("num")
+            or inner.get("points")
+            or inner.get("integral")
+        )
 
         already_signed = any(k in msg for k in ("今日已签到", "已签到", "今天已经签", "重复签到", "明天再来"))
         success = (not error) or already_signed or ("成功" in msg)
@@ -652,6 +641,7 @@ class Top123CheckIn(_PluginBase):
     def _open_account_clients(self, account: Dict[str, Any]):
         key = account["key"]
         proxies = self._get_proxies()
+        cookie_str = self._prepare_account_cookies(account)
 
         # 1. Requests session
         session = requests.Session()
@@ -659,7 +649,7 @@ class Top123CheckIn(_PluginBase):
         session.verify = self._verify_ssl
         if proxies:
             session.proxies.update(proxies)
-        for name, value in self._cookie_pairs(account["cookie"]):
+        for name, value in self._cookie_pairs(cookie_str):
             session.cookies.set(name, value, domain="123.qsxy.top")
             session.cookies.set(name, value, domain=".qsxy.top")
 
@@ -682,7 +672,7 @@ class Top123CheckIn(_PluginBase):
                 curl_session.headers.update({"User-Agent": self.USER_AGENT})
                 if proxies:
                     curl_session.proxies = proxies
-                for name, value in self._cookie_pairs(account["cookie"]):
+                for name, value in self._cookie_pairs(cookie_str):
                     try:
                         curl_session.cookies.set(name, value, domain="123.qsxy.top")
                         curl_session.cookies.set(name, value, domain=".qsxy.top")

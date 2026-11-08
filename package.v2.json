@@ -76,12 +76,13 @@
   "HDHavenCheckIn": {
     "name": "栖影 HDHaven 每日签到",
     "description": "支持栖影 HDHaven (hdhaven.com) 每日自动签到，支持多账号 Cookie 换行配置、API 直连与浏览器自动化点击双模式、积分与连续签到统计、签到历史与通知。",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "level": 1,
     "author": "kbmgr",
     "authorUrl": "https://github.com/AboutYour",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/movie.png",
     "history": {
+      "v1.0.1": "新增固定代理服务器 (proxy_server) 配置项，支持配置独立 HTTP/SOCKS5 代理直接路由签到请求；支持直连、固定代理和系统代理自动降级与日志追踪。",
       "v1.0.0": "初始版本：支持 HDHaven (https://hdhaven.com/me#account-points) 每日立即签到/赌狗签到、多账号批量执行、积分与连续签到统计、签到历史记录与通知。"
     }
   }

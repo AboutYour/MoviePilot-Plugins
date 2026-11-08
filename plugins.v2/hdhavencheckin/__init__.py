@@ -50,7 +50,7 @@ class HDHavenCheckIn(_PluginBase):
     plugin_name = "栖影 HDHaven 每日签到"
     plugin_desc = "支持栖影 HDHaven (hdhaven.com) 每日自动签到，支持多账号、API直连与浏览器双模式、积分与连续签到统计、历史记录与通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/movie.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/AboutYour"
     plugin_config_prefix = "hdhavencheckin_"
@@ -75,7 +75,8 @@ class HDHavenCheckIn(_PluginBase):
     _cookies_text = ""
     _checkin_mode = "normal"  # normal: 立即签到; gamble: 赌狗签到
     _use_browser = False  # API 直连急速稳定，无 Playwright 自动走 API
-    _use_proxy = False  # 站点为国内/直连友好，默认直连
+    _use_proxy = False  # 网络代理开关
+    _proxy_server = ""  # 固定代理服务器（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）
     _verify_ssl = False
     _max_retries = 3
     _min_delay = 3
@@ -99,6 +100,7 @@ class HDHavenCheckIn(_PluginBase):
         self._checkin_mode = "normal"
         self._use_browser = False
         self._use_proxy = False
+        self._proxy_server = ""
         self._verify_ssl = False
         self._max_retries = 3
         self._min_delay = 3
@@ -119,7 +121,10 @@ class HDHavenCheckIn(_PluginBase):
             ).strip()
             self._checkin_mode = str(config.get("checkin_mode") or "normal").strip()
             self._use_browser = bool(config.get("use_browser", False))
+            self._proxy_server = str(config.get("proxy_server") or "").strip()
             self._use_proxy = bool(config.get("use_proxy", False))
+            if self._proxy_server and not self._use_proxy:
+                self._use_proxy = True
             self._verify_ssl = bool(config.get("verify_ssl", False))
             self._max_retries = self._as_int(config.get("max_retries"), 3, 0, 10)
             self._min_delay = self._as_int(config.get("min_delay"), 3, 0, 300)
@@ -168,6 +173,7 @@ class HDHavenCheckIn(_PluginBase):
             "checkin_mode": self._checkin_mode,
             "use_browser": self._use_browser,
             "use_proxy": self._use_proxy,
+            "proxy_server": self._proxy_server,
             "verify_ssl": self._verify_ssl,
             "max_retries": self._max_retries,
             "min_delay": self._min_delay,
@@ -503,6 +509,7 @@ class HDHavenCheckIn(_PluginBase):
                     ],
                 }
                 if proxy_server:
+                    logger.info(f"栖影 HDHaven 签到：{account['remark']} Playwright 浏览器使用网络代理: {proxy_server}")
                     launch_kwargs["proxy"] = {"server": proxy_server}
 
                 browser = p.chromium.launch(**launch_kwargs)
@@ -600,6 +607,10 @@ class HDHavenCheckIn(_PluginBase):
         key = account["key"]
         proxies = self._get_proxies()
         cookie_str = account["cookie"]
+
+        if proxies:
+            srv = proxies.get("http") or proxies.get("https")
+            logger.info(f"栖影 HDHaven 签到：{account['remark']} HTTP 会话使用网络代理: {srv}")
 
         # 1. Requests session
         session = requests.Session()
@@ -709,6 +720,14 @@ class HDHavenCheckIn(_PluginBase):
         time.sleep(delay)
 
     def _get_proxies(self) -> Optional[Dict[str, str]]:
+        # 1. 优先使用用户配置的固定网络代理
+        proxy_server = (self._proxy_server or "").strip()
+        if proxy_server:
+            if "://" not in proxy_server:
+                proxy_server = f"http://{proxy_server}"
+            return {"http": proxy_server, "https": proxy_server}
+
+        # 2. 如果未配置固定代理，但启用了代理开关，则回退使用 MoviePilot 系统全局代理
         if not self._use_proxy:
             return None
         proxy = getattr(settings, "PROXY", None)
@@ -717,6 +736,8 @@ class HDHavenCheckIn(_PluginBase):
         if isinstance(proxy, str):
             proxy = proxy.strip()
             if proxy:
+                if "://" not in proxy:
+                    proxy = f"http://{proxy}"
                 return {"http": proxy, "https": proxy}
             return None
         if isinstance(proxy, dict):
@@ -746,6 +767,10 @@ class HDHavenCheckIn(_PluginBase):
             if http_str or https_str:
                 final_http = http_str or https_str
                 final_https = https_str or http_str
+                if "://" not in final_http:
+                    final_http = f"http://{final_http}"
+                if "://" not in final_https:
+                    final_https = f"http://{final_https}"
                 return {"http": final_http, "https": final_https}
         return None
 
@@ -828,7 +853,7 @@ class HDHavenCheckIn(_PluginBase):
                         self._col_switch("notify", "发送汇总通知"),
                         self._col_switch("onlyonce", "立即运行一次"),
                         self._col_switch("use_browser", "使用浏览器自动化(可选)"),
-                        self._col_switch("use_proxy", "使用系统代理"),
+                        self._col_switch("use_proxy", "使用网络代理"),
                         self._col_switch("verify_ssl", "验证 SSL 证书"),
                         self._col_switch("clear_history", "清除历史记录"),
                     ],
@@ -848,6 +873,18 @@ class HDHavenCheckIn(_PluginBase):
                                         {"title": "立即签到 (稳妥获取基础积分，推荐)", "value": "normal"},
                                         {"title": "赌狗签到 (高风险随机博弈)", "value": "gamble"},
                                     ],
+                                },
+                            }],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "sm": 6},
+                            "content": [{
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "proxy_server",
+                                    "label": "固定代理服务器 (优先走此代理)",
+                                    "placeholder": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080 (留空使用系统代理)",
                                 },
                             }],
                         },
@@ -888,6 +925,7 @@ class HDHavenCheckIn(_PluginBase):
                         "text": (
                             "支持栖影 HDHaven (https://hdhaven.com/me#account-points) 每日自动签到。\n"
                             "多个账号请用回车换行分隔（每行一个完整 Cookie 或 hdh_session 值）。\n"
+                            "网络代理：如需指定独立代理，请在「固定代理服务器」配置（支持 http:// 或 socks5://），开启后直接走该代理进行签到；留空且开启「使用网络代理」时则走系统全局代理。\n"
                             "提示：请确保 Cookie 包含「hdh_session」有效登录会话。"
                         ),
                     },
@@ -902,6 +940,7 @@ class HDHavenCheckIn(_PluginBase):
             "checkin_mode": "normal",
             "use_browser": False,
             "use_proxy": False,
+            "proxy_server": "",
             "verify_ssl": False,
             "max_retries": 3,
             "min_delay": 3,

@@ -1,5 +1,6 @@
 """123云盘臻藏阁 (123.qsxy.top) 每日自动签到插件。"""
 
+import hashlib
 import json
 import random
 import re
@@ -42,7 +43,7 @@ class Top123CheckIn(_PluginBase):
     plugin_name = "123云盘臻藏阁每日签到"
     plugin_desc = "支持 123云盘臻藏阁 (123.qsxy.top) 每日自动签到，自动点击用户中心抽屉并触发签到，支持多账号、签到历史与通知。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "kbmgr"
     author_url = "https://github.com/AboutYour"
     plugin_config_prefix = "top123checkin_"
@@ -51,7 +52,6 @@ class Top123CheckIn(_PluginBase):
 
     BASE_URL = "https://123.qsxy.top"
     CHECKIN_PAGE_URL = "https://123.qsxy.top/"
-    B2_CHECKIN_API_URL = "https://123.qsxy.top/wp-json/b2/v1/userCheckIn"
     AJAX_CHECKIN_API_URL = "https://123.qsxy.top/wp-admin/admin-ajax.php"
 
     USER_AGENT = (
@@ -163,18 +163,35 @@ class Top123CheckIn(_PluginBase):
         })
 
     @staticmethod
-    def _extract_username_from_cookie(cookie_str: str) -> str:
+    def _extract_account_info_from_cookie(cookie_str: str) -> Tuple[str, str, bool]:
+        """
+        从 Cookie 中提取 WordPress 登录用户名与过期时间，返回 (username, expire_time_str, is_expired)
+        """
+        username = ""
+        expire_time = ""
+        is_expired = False
         for part in cookie_str.split(";"):
             name, sep, value = part.strip().partition("=")
             if sep and name.strip().startswith("wordpress_logged_in_") and value.strip():
                 try:
                     decoded = unquote(value.strip())
-                    username = decoded.split("|")[0].strip()
-                    if username:
-                        return username
+                    parts = decoded.split("|")
+                    if parts and parts[0].strip():
+                        username = parts[0].strip()
+                    if len(parts) > 1 and parts[1].strip().isdigit():
+                        exp_ts = int(parts[1].strip())
+                        exp_dt = datetime.fromtimestamp(exp_ts)
+                        expire_time = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        if exp_dt < datetime.now():
+                            is_expired = True
                 except Exception:
                     pass
-        return ""
+        return username, expire_time, is_expired
+
+    @staticmethod
+    def _extract_username_from_cookie(cookie_str: str) -> str:
+        u, _, _ = Top123CheckIn._extract_account_info_from_cookie(cookie_str)
+        return u
 
     @staticmethod
     def _cookie_pairs(cookie_str: str) -> List[Tuple[str, str]]:
@@ -224,7 +241,7 @@ class Top123CheckIn(_PluginBase):
                 logger.warning(f"123云盘臻藏阁签到：第 {idx} 行 Cookie 格式无效，已跳过")
                 continue
 
-            username = self._extract_username_from_cookie(cookie)
+            username, expire_time, is_expired = self._extract_account_info_from_cookie(cookie)
             account_index = len(accounts) + 1
             if not remark:
                 remark = f"123云盘账号{account_index}" + (f"({username})" if username else "")
@@ -234,6 +251,8 @@ class Top123CheckIn(_PluginBase):
                 "index": account_index,
                 "remark": remark,
                 "username": username,
+                "expire_time": expire_time,
+                "expired": is_expired,
                 "cookie": cookie,
                 "base_url": self.BASE_URL,
             })
@@ -291,6 +310,48 @@ class Top123CheckIn(_PluginBase):
         finally:
             self._close_account_clients(account["key"])
 
+    def _prepare_account_cookies(self, account: Dict[str, Any]) -> str:
+        """
+        预热会话并自动补全宝塔防火墙 (BTWAF) Cookie 与基础会话 Cookie
+        """
+        cookie_str = account.get("cookie", "")
+        pairs = dict(self._cookie_pairs(cookie_str))
+
+        # 尝试访问首页获取最新的会话 Cookie 与 BTWAF 盾
+        headers = {
+            "User-Agent": self.USER_AGENT,
+            "Referer": self.CHECKIN_PAGE_URL,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        try:
+            resp = self._request(account, "get", self.CHECKIN_PAGE_URL, headers=headers, timeout=15)
+            body = getattr(resp, "text", "") or ""
+            # 1. 检查是否有 BTWAF 盾
+            match = re.search(r'(btwaf-[a-f0-9]+-[a-f0-9]+)', body)
+            if match:
+                c_name = match.group(1)
+                c_val = hashlib.sha256(self.USER_AGENT.encode("utf-8")).hexdigest()
+                pairs[c_name] = c_val
+                logger.info(f"123云盘臻藏阁签到：{account['remark']} 自动识别并计算 BTWAF 防火墙验证 ({c_name})")
+
+            # 2. 同步响应中的 Set-Cookie
+            if hasattr(resp, "cookies"):
+                for k, v in resp.cookies.items():
+                    if k not in pairs or not pairs[k]:
+                        pairs[k] = v
+        except Exception as exc:
+            logger.debug(f"123云盘臻藏阁签到：{account['remark']} 预热请求失败：{exc}")
+
+        # 如果没有识别出 btwaf，但已知该站常用盾格式，注入预置校验
+        if not any(k.startswith("btwaf-") for k in pairs):
+            c_val = hashlib.sha256(self.USER_AGENT.encode("utf-8")).hexdigest()
+            pairs["btwaf-21cb7f37099ce405e82768674d54a499-0711fc5487872cd6"] = c_val
+
+        # 重新组合完整的 Cookie 字符串
+        final_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
+        account["full_cookie"] = final_cookie
+        return final_cookie
+
     def _sign_account(self, account: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"123云盘臻藏阁签到：正在签到 {account['remark']}")
 
@@ -302,33 +363,67 @@ class Top123CheckIn(_PluginBase):
 
         # 2. 备用 HTTP 接口请求（如果无 Playwright 或浏览器模式失败回退）
         logger.info(f"123云盘臻藏阁签到：{account['remark']} 尝试 HTTP 接口签到")
+
+        # 检查是否包含 wordpress_logged_in_ 凭证
+        if not account.get("username"):
+            logger.warning(
+                f"123云盘臻藏阁签到：{account['remark']} 的 Cookie 中未检测到 wordpress_logged_in_* 凭证，"
+                f"可能未复制完整 Cookie！"
+            )
+
+        # 检查 Cookie 是否已在本地解析判定为过期
+        if account.get("expired"):
+            exp_time = account.get("expire_time", "未知时间")
+            logger.error(
+                f"123云盘臻藏阁签到：{account['remark']} 的 Cookie 已于 {exp_time} 过期！"
+                f"请在浏览器中重新登录 123.qsxy.top 并获取最新 Cookie。"
+            )
+            return self._result(
+                account,
+                False,
+                f"Cookie 已过期({exp_time})，请重新登录获取",
+                retryable=False,
+            )
+        elif account.get("expire_time"):
+            logger.info(f"123云盘臻藏阁签到：{account['remark']} Cookie 登录有效期至 {account['expire_time']}")
+
+        # 自动补全 BTWAF 与会话 Cookie
+        cookie_header = self._prepare_account_cookies(account)
         headers = {
             "User-Agent": self.USER_AGENT,
             "Referer": self.CHECKIN_PAGE_URL,
             "Origin": self.BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Cookie": cookie_header,
         }
 
-        # 尝试 B2 主题 REST 接口
+        # 尝试查询当前用户状态 (get_current_user) 验证登录有效性
         try:
-            resp = self._request(
+            curr_resp = self._request(
                 account,
                 "post",
-                self.B2_CHECKIN_API_URL,
+                self.AJAX_CHECKIN_API_URL,
+                data={"action": "get_current_user"},
                 headers=headers,
-                timeout=20,
+                timeout=15,
             )
-            if resp.status_code == 200:
+            if curr_resp.status_code == 200:
                 try:
-                    data = resp.json()
-                    return self._parse_api_response(account, data)
+                    curr_data = curr_resp.json()
+                    user_id = curr_data.get("id") or (curr_data.get("user_data") or {}).get("id")
+                    if user_id and int(user_id) > 0:
+                        user_name = (curr_data.get("user_data") or {}).get("name") or account.get("username")
+                        logger.info(f"123云盘臻藏阁签到：{account['remark']} 身份验证通过 (UID: {user_id}, 昵称: {user_name})")
+                    else:
+                        logger.warning(f"123云盘臻藏阁签到：{account['remark']} 获取用户信息显示未登录，Cookie 可能已失效")
                 except Exception:
                     pass
         except Exception as exc:
-            logger.warning(f"123云盘臻藏阁签到：B2 REST 接口失败：{exc}")
+            logger.debug(f"123云盘臻藏阁签到：{account['remark']} 获取用户信息接口异常：{exc}")
 
-        # 尝试 WordPress admin-ajax 接口
+        # 发送 WordPress 子比主题 (Zibll) 签到请求
         try:
             ajax_data = {"action": "user_checkin"}
             resp = self._request(
@@ -339,33 +434,68 @@ class Top123CheckIn(_PluginBase):
                 headers=headers,
                 timeout=20,
             )
+            logger.info(f"123云盘臻藏阁签到：{account['remark']} 签到接口响应状态码：{resp.status_code}")
+
             if resp.status_code == 200:
                 try:
                     data = resp.json()
                     return self._parse_api_response(account, data)
                 except Exception:
-                    if "今日已签到" in resp.text:
+                    text = resp.text.strip()
+                    if any(k in text for k in ("今日已签到", "已签到", "今天已经签")):
                         return self._result(account, True, "今日已签到", already_signed=True)
-                    return self._result(account, True, "签到响应成功")
+                    if "成功" in text:
+                        return self._result(account, True, "签到成功")
+                    if text == "0" or any(k in text for k in ("未登录", "请先登录", "登录已失效")):
+                        logger.error(f"123云盘臻藏阁签到：{account['remark']} 未通过认证 (响应: {text[:50]})，Cookie 可能已失效")
+                        return self._result(account, False, "未登录或 Cookie 已失效(400/0)，请重新获取 Cookie", retryable=False)
+                    return self._result(account, True, f"签到完成 ({text[:30]})")
+            elif resp.status_code == 400:
+                text = resp.text.strip()
+                logger.error(
+                    f"123云盘臻藏阁签到：{account['remark']} 接口返回 400 错误 (响应: {text})，"
+                    f"未通过 WordPress 登录校验，Cookie 已失效或未包含完整认证信息"
+                )
+                return self._result(account, False, "未通过认证，Cookie 无效或已过期(HTTP 400/0)，请重新获取 Cookie", retryable=False)
+            elif resp.status_code == 403:
+                logger.error(f"123云盘臻藏阁签到：{account['remark']} 访问被拦截 (HTTP 403)，可能受到宝塔防火墙或 IP 限制")
+                return self._result(account, False, "访问被拦截(HTTP 403)，请检查代理或防火墙设置", retryable=False)
+            else:
+                logger.error(f"123云盘臻藏阁签到：{account['remark']} 接口异常状态码：{resp.status_code}，响应：{resp.text[:100]}")
+                return self._result(account, False, f"接口异常 HTTP {resp.status_code}")
         except Exception as exc:
-            logger.error(f"123云盘臻藏阁签到：admin-ajax 接口失败：{exc}")
-
-        return self._result(account, False, "签到请求未成功，请检查 Cookie 或开启浏览器模式")
+            logger.error(f"123云盘臻藏阁签到：admin-ajax 接口请求异常：{exc}", exc_info=True)
+            return self._result(account, False, f"请求异常：{exc}")
 
     def _parse_api_response(self, account: Dict[str, Any], data: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             return self._result(account, True, "签到完成")
-        msg = data.get("msg") or data.get("message") or ""
-        credit = data.get("credit") or data.get("points") or data.get("gold")
-        already_signed = "今日已签到" in msg or "已签到" in msg or "重复" in msg
-        success = already_signed or bool(data.get("status") in (200, "success", 1, True)) or ("成功" in msg)
-        return self._result(
-            account,
-            success=success,
-            message=msg or ("签到成功" if success else "签到未确认"),
-            already_signed=already_signed,
-            points=credit,
-        )
+        error = data.get("error")
+        msg = str(data.get("msg") or data.get("message") or "")
+        credit = data.get("points") or data.get("credit") or data.get("gold") or data.get("num")
+
+        already_signed = any(k in msg for k in ("今日已签到", "已签到", "今天已经签", "重复签到", "明天再来"))
+        success = (not error) or already_signed or ("成功" in msg)
+
+        if success:
+            display_msg = msg or ("今日已签到" if already_signed else "签到成功")
+            return self._result(
+                account,
+                success=True,
+                message=display_msg,
+                already_signed=already_signed,
+                points=credit,
+            )
+        else:
+            is_unauth = any(k in msg for k in ("登录", "未登录", "失效", "重新登录", "权限"))
+            if is_unauth:
+                logger.error(f"123云盘臻藏阁签到：{account['remark']} 提示未登录：{msg}")
+            return self._result(
+                account,
+                success=False,
+                message=msg or "签到未确认",
+                retryable=not is_unauth,
+            )
 
     def _sign_via_playwright(self, account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -377,8 +507,8 @@ class Top123CheckIn(_PluginBase):
         """
         try:
             from playwright.sync_api import sync_playwright
-        except Exception as exc:
-            logger.warning(f"123云盘臻藏阁签到：未安装 Playwright 或不可用：{exc}")
+        except Exception:
+            logger.info("123云盘臻藏阁签到：环境未安装 Playwright 或浏览器引擎不可用，自动使用 HTTP 接口签到")
             return None
 
         proxies = self._get_proxies()
@@ -531,6 +661,7 @@ class Top123CheckIn(_PluginBase):
             session.proxies.update(proxies)
         for name, value in self._cookie_pairs(account["cookie"]):
             session.cookies.set(name, value, domain="123.qsxy.top")
+            session.cookies.set(name, value, domain=".qsxy.top")
 
         # 2. Cloudscraper session
         scraper = None
@@ -554,6 +685,7 @@ class Top123CheckIn(_PluginBase):
                 for name, value in self._cookie_pairs(account["cookie"]):
                     try:
                         curl_session.cookies.set(name, value, domain="123.qsxy.top")
+                        curl_session.cookies.set(name, value, domain=".qsxy.top")
                     except Exception:
                         pass
             except Exception as exc:
@@ -561,9 +693,9 @@ class Top123CheckIn(_PluginBase):
                 curl_session = None
 
         self._account_clients[key] = {
-            "curl_session": curl_session,
-            "scraper": scraper,
             "session": session,
+            "scraper": scraper,
+            "curl_session": curl_session,
         }
 
     def _close_account_clients(self, key: str):
@@ -585,7 +717,7 @@ class Top123CheckIn(_PluginBase):
     def _request(self, account: Dict[str, Any], method: str, url: str, **kwargs):
         clients = self._account_clients.get(account["key"]) or {}
         errors = []
-        for name in ("curl_session", "scraper", "session"):
+        for name in ("session", "scraper", "curl_session"):
             client = clients.get(name)
             if client is None:
                 continue
@@ -781,7 +913,8 @@ class Top123CheckIn(_PluginBase):
                         "text": (
                             "支持 123云盘臻藏阁 (https://123.qsxy.top/) 每日自动签到。\n"
                             "多个账号请用回车换行分隔（每行一个完整 Cookie）。\n"
-                            "注意：123.qsxy.top 为国内站点，建议关闭「使用系统代理」（直连访问），避免被宝塔防火墙切断连接 (ERR_CONNECTION_CLOSED)。"
+                            "重要提示：请确保复制的完整 Cookie 中包含「wordpress_logged_in_*」登录凭证；\n"
+                            "注意：123.qsxy.top 为国内站点，建议关闭「使用系统代理」（直连访问），避免被宝塔防火墙切断连接。"
                         ),
                     },
                 },

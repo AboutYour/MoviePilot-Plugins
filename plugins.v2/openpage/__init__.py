@@ -201,13 +201,14 @@ class OpenPage(_PluginBase):
                 data = json.loads(line)
                 if not data.get("enabled", True):
                     return None
-                url = str(data.get("url") or data.get("site") or "").strip()
+                checkin_url = str(data.get("checkin_url") or data.get("url") or data.get("site") or "").strip()
+                login_url = str(data.get("login_url") or checkin_url).strip()
                 username = str(data.get("username") or data.get("user") or "").strip()
                 password = str(data.get("password") or data.get("pass") or "").strip()
                 remark = str(data.get("remark") or data.get("name") or "").strip()
                 proxy = str(data.get("proxy") or data.get("proxy_server") or "").strip()
-                if url:
-                    return self._build_site_item(index, url, username, password, remark, proxy)
+                if checkin_url:
+                    return self._build_site_item(index, login_url, checkin_url, username, password, remark, proxy)
             except Exception:
                 pass
 
@@ -246,32 +247,48 @@ class OpenPage(_PluginBase):
         if not parts:
             return None
 
-        url = parts[0]
-        username = parts[1] if len(parts) >= 2 else ""
-        password = parts[2] if len(parts) >= 3 else ""
-        proxy = parts[3] if len(parts) >= 4 else ""
+        # 判断是否分别提供了登录地址和签到地址
+        # 若 parts[0] 和 parts[1] 均为 http:// 或 https:// 开头的 URL：
+        #   parts[0]: login_url, parts[1]: checkin_url, parts[2]: username, parts[3]: password
+        if len(parts) >= 4 and any(parts[1].startswith(p) for p in ("http://", "https://")):
+            login_url = parts[0]
+            checkin_url = parts[1]
+            username = parts[2]
+            password = parts[3]
+            proxy = parts[4] if len(parts) >= 5 else ""
+        else:
+            checkin_url = parts[0]
+            login_url = parts[0]
+            username = parts[1] if len(parts) >= 2 else ""
+            password = parts[2] if len(parts) >= 3 else ""
+            proxy = parts[3] if len(parts) >= 4 else ""
 
-        if not url:
+        if not checkin_url:
             return None
 
-        return self._build_site_item(index, url, username, password, remark, proxy)
+        return self._build_site_item(index, login_url, checkin_url, username, password, remark, proxy)
 
     def _build_site_item(
         self,
         index: int,
-        url: str,
+        login_url: str,
+        checkin_url: str,
         username: str,
         password: str,
         remark: str = "",
         proxy: str = "",
     ) -> Dict[str, Any]:
         # 规范化 URL
-        cleaned_url = url.strip()
-        if not cleaned_url.startswith("http://") and not cleaned_url.startswith("https://"):
-            cleaned_url = f"https://{cleaned_url}"
+        cleaned_checkin = checkin_url.strip()
+        if not cleaned_checkin.startswith("http://") and not cleaned_checkin.startswith("https://"):
+            cleaned_checkin = f"https://{cleaned_checkin}"
 
-        parsed_url = urlparse(cleaned_url)
-        hostname = parsed_url.hostname or cleaned_url
+        cleaned_login = login_url.strip()
+        if not cleaned_login.startswith("http://") and not cleaned_login.startswith("https://"):
+            cleaned_login = f"https://{cleaned_login}"
+
+        parsed_url = urlparse(cleaned_checkin)
+        hostname = parsed_url.hostname or cleaned_checkin
 
         if not remark:
             remark = f"站点{index} ({hostname})"
@@ -279,7 +296,9 @@ class OpenPage(_PluginBase):
         return {
             "key": f"site:{index}:{hostname}",
             "index": index,
-            "url": cleaned_url,
+            "url": cleaned_checkin,
+            "checkin_url": cleaned_checkin,
+            "login_url": cleaned_login,
             "hostname": hostname,
             "username": username.strip(),
             "password": password.strip(),
@@ -376,7 +395,7 @@ class OpenPage(_PluginBase):
         return self._sign_via_requests(site, proxy)
 
     def _sign_via_playwright(self, site: Dict[str, Any], proxy: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Playwright 浏览器自动化：自动识别登录表单、填写账号密码并点击签到按钮。"""
+        """Playwright 浏览器自动化：自动登录对应地址，打开签到地址完成签到与保活。"""
         try:
             from playwright.sync_api import sync_playwright
         except Exception as exc:
@@ -396,6 +415,10 @@ class OpenPage(_PluginBase):
             launch_kwargs["proxy"] = {"server": proxy}
 
         timeout_ms = self._page_timeout * 1000
+        login_url = site.get("login_url") or site.get("url")
+        checkin_url = site.get("checkin_url") or site.get("url")
+        username = site.get("username", "")
+        password = site.get("password", "")
 
         try:
             with sync_playwright() as p:
@@ -408,35 +431,19 @@ class OpenPage(_PluginBase):
                     )
                     page = context.new_page()
 
-                    # 1. 打开签到/登录页面
-                    logger.info(f"网页批量签到：{site['remark']} 正在打开页面 {site['url']} ...")
+                    # 1. 访问对应登录地址（或直接访问签到地址）
+                    logger.info(f"网页批量签到：{site['remark']} 正在访问对应地址：{login_url} ...")
                     try:
-                        page.goto(site["url"], wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
                     except Exception as goto_exc:
-                        logger.warning(f"网页批量签到：{site['remark']} 页面初次加载超时，尝试继续：{goto_exc}")
+                        logger.warning(f"网页批量签到：{site['remark']} 访问地址超时/继续：{goto_exc}")
 
                     page.wait_for_timeout(2000)
 
-                    # 2. 检查是否已经处于签到状态
-                    already_signed_text = self._check_already_signed_text(page)
-                    if already_signed_text:
-                        logger.info(f"网页批量签到：{site['remark']} 页面检测到已签到：{already_signed_text}")
-                        return self._result(
-                            site,
-                            success=True,
-                            status="已签到",
-                            message=already_signed_text,
-                            already_signed=True,
-                            proxy=proxy,
-                        )
-
-                    # 3. 登录处理（如果页面包含账号/密码输入框，或者需要登录）
-                    username = site["username"]
-                    password = site["password"]
+                    # 2. 如果页面包含账号密码输入框，执行登录
                     if username and password:
                         logged_in = self._perform_auto_login(page, username, password, site["remark"])
                         if logged_in is False:
-                            # 明确检测到登录失败错误提示
                             err_msg = self._extract_error_message(page) or "登录失败（账号或密码错误）"
                             logger.error(f"网页批量签到：{site['remark']} {err_msg}")
                             return self._result(
@@ -447,41 +454,56 @@ class OpenPage(_PluginBase):
                                 retryable=False,
                                 proxy=proxy,
                             )
+                        page.wait_for_timeout(2000)
 
-                    # 4. 再次检查是否已签到
-                    page.wait_for_timeout(2000)
+                    # 3. 打开签到地址
+                    current_url = page.url.rstrip("/")
+                    target_checkin = checkin_url.rstrip("/")
+                    if current_url != target_checkin:
+                        logger.info(f"网页批量签到：{site['remark']} 正在打开签到地址：{checkin_url} ...")
+                        try:
+                            page.goto(checkin_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        except Exception as goto_checkin_exc:
+                            logger.warning(f"网页批量签到：{site['remark']} 打开签到地址超时/继续：{goto_checkin_exc}")
+                        page.wait_for_timeout(2500)
+                    else:
+                        logger.info(f"网页批量签到：{site['remark']} 当前已在签到地址：{checkin_url}")
+
+                    page_title = page.title() or site["hostname"]
+
+                    # 4. 检查是否检测到已签到
                     already_signed_text = self._check_already_signed_text(page)
                     if already_signed_text:
-                        logger.info(f"网页批量签到：{site['remark']} 登录后检测到今日已签到：{already_signed_text}")
+                        logger.info(f"网页批量签到：{site['remark']} 页面检测到已签到：{already_signed_text}")
                         return self._result(
                             site,
                             success=True,
                             status="已签到",
-                            message=already_signed_text,
+                            message=f"已成功登录并打开签到地址（{already_signed_text}）",
                             already_signed=True,
                             proxy=proxy,
                         )
 
-                    # 5. 寻找并点击签到按钮
+                    # 5. 若页面有显式签到按钮，顺带点击
                     click_res = self._find_and_click_checkin(page, site["remark"])
                     if click_res:
+                        msg = click_res.get("message") or "已点击签到"
                         return self._result(
                             site,
-                            success=click_res.get("success", True),
+                            success=True,
                             status=click_res.get("status", "成功"),
-                            message=click_res.get("message", "签到成功"),
+                            message=f"已登录并打开签到地址（{msg}）",
                             already_signed=click_res.get("already_signed", False),
                             proxy=proxy,
                         )
 
-                    # 6. 未找到显式签到按钮：若已成功访问/登录保活，作为成功处理
-                    page_title = page.title() or site["hostname"]
-                    logger.info(f"网页批量签到：{site['remark']} 页面已成功加载并完成保活访问 ({page_title})")
+                    # 6. 只要成功登录对应地址并打开签到地址，即代表签到/保活成功
+                    logger.info(f"网页批量签到：{site['remark']} 登录并成功打开签到地址 ({page_title})")
                     return self._result(
                         site,
                         success=True,
-                        status="已访问",
-                        message=f"登录并访问成功（{page_title}）",
+                        status="成功",
+                        message=f"已成功登录并打开签到地址（{page_title}）",
                         already_signed=False,
                         proxy=proxy,
                     )
@@ -792,7 +814,7 @@ class OpenPage(_PluginBase):
         return None
 
     def _sign_via_requests(self, site: Dict[str, Any], proxy: Optional[str]) -> Dict[str, Any]:
-        """HTTP 请求模式（Playwright 不可用时的备选与基础保活）。"""
+        """HTTP 请求模式（Playwright 不可用时的备选与保活）。"""
         proxies = {"http": proxy, "https": proxy} if proxy else None
         headers = {
             "User-Agent": self.USER_AGENT,
@@ -805,17 +827,30 @@ class OpenPage(_PluginBase):
         if proxies:
             session.proxies.update(proxies)
 
+        login_url = site.get("login_url") or site.get("url")
+        checkin_url = site.get("checkin_url") or site.get("url")
+
         try:
-            resp = session.get(site["url"], timeout=self._page_timeout, verify=False)
+            # 1. 访问对应登录地址
+            if login_url != checkin_url:
+                try:
+                    session.get(login_url, timeout=self._page_timeout, verify=False)
+                except Exception:
+                    pass
+
+            # 2. 打开签到地址
+            resp = session.get(checkin_url, timeout=self._page_timeout, verify=False)
             if resp.status_code == 200:
                 html = resp.text
                 if any(kw in html for kw in ("今日已签到", "今天已经签到", "已签到")):
-                    return self._result(site, True, "已签到", "今日已签到(页面检测)", already_signed=True, proxy=proxy)
+                    return self._result(
+                        site, True, "已签到", "今日已签到（页面检测）", already_signed=True, proxy=proxy
+                    )
                 return self._result(
                     site,
                     True,
-                    "已访问",
-                    "HTTP 请求成功（已访问页面保活）",
+                    "成功",
+                    "HTTP 请求成功（已成功打开签到地址）",
                     already_signed=False,
                     proxy=proxy,
                 )
@@ -930,14 +965,14 @@ class OpenPage(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         example = (
-            "# 格式A：签到地址+用户名+密码（支持换行维护多个站点，依次执行）\n"
-            "https://example.com/login+myusername+mypassword\n\n"
-            "# 方式2：在前面增加自定义备注（备注#签到地址+用户名+密码）\n"
-            "我的论坛#https://bbs.example.com/login+user2+pass2\n\n"
-            "# 方式3：支持 # 或 | 分隔\n"
-            "https://site3.com/signin#user3#pass3\n\n"
-            "# 方式4：针对某个站点独立指定代理（第4项可选）\n"
-            "https://site4.com/login+user4+pass4+http://127.0.0.1:7890"
+            "# 格式1：签到地址+用户名+密码（自动登录对应地址，并打开签到地址）\n"
+            "https://example.com/me#account-points+myusername+mypassword\n\n"
+            "# 格式2：登录地址+签到地址+用户名+密码（登录地址与签到地址不同时）\n"
+            "https://example.com/login+https://example.com/attendance.php+myuser+mypass\n\n"
+            "# 方式3：自定义备注#签到地址+用户名+密码\n"
+            "我的站点#https://bbs.example.com/daka.php+user2+pass2\n\n"
+            "# 方式4：末尾指定独立固定代理（可选）\n"
+            "https://site3.com/checkin+user3+pass3+http://127.0.0.1:7890"
         )
         return [{
             "component": "VForm",
@@ -1008,10 +1043,11 @@ class OpenPage(_PluginBase):
                         "type": "info",
                         "variant": "tonal",
                         "text": (
-                            "支持批量维护多个站点进行网页自动登录与签到：\n"
-                            "1. 格式：签到地址+用户名+密码（多个站点每行一个，依次执行）。\n"
-                            "2. 固定代理维护：在「固定代理服务器」填写（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080），开启后直接走该固定代理。\n"
-                            "3. 顺序执行与统一通知：维护多个站点时，将按设置依次顺序执行；全部站点执行完成后统一汇总发送通知。"
+                            "网页批量登录签到：\n"
+                            "1. 核心流程：自动登录对应的地址，随后打开签到地址完成签到与保活。\n"
+                            "2. 配置格式：支持「签到地址+用户名+密码」或「登录地址+签到地址+用户名+密码」（每行一个站点，回车换行）。\n"
+                            "3. 固定代理：支持在「固定代理服务器」配置固定代理（http:// 或 socks5://），直接走该代理进行访问。\n"
+                            "4. 顺序执行与统一通知：维护多个站点时依次执行，全部维护完毕后统一发送汇总通知。"
                         ),
                     },
                 },

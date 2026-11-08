@@ -218,12 +218,15 @@ class JYingCheckIn(_PluginBase):
                 parts = [part.strip() for part in line.split("#") if part.strip()]
                 if len(parts) == 3:
                     remark, username, password = parts
+                    cookie = ""
                 elif len(parts) == 2:
                     username, password = parts
+                    cookie = ""
             elif ":" in line and "=" not in line and ";" not in line:
                 parts = [part.strip() for part in line.split(":", 1) if part.strip()]
                 if len(parts) == 2:
                     username, password = parts
+                    cookie = ""
 
             if cookie.lower().startswith("cookie:"):
                 cookie = cookie.split(":", 1)[1].strip()
@@ -253,16 +256,18 @@ class JYingCheckIn(_PluginBase):
                     app_user_token = password
                 password = ""
 
-            # 如果用户直接粘贴了纯 Token 字符串（包含 eyJ 或长字符串）
-            if not app_user_token:
-                if "eyJ" in cookie:
-                    for part in cookie.split(";"):
-                        part = part.strip()
-                        if "eyJ" in part:
-                            app_user_token = part.split("=", 1)[-1].strip()
-                            break
-                elif "=" not in cookie and len(cookie) >= 20:
-                    app_user_token = cookie.strip()
+            # 如果已有账号密码，不需要从原字符串猜测 token
+            if not (username and password):
+                # 如果用户直接粘贴了纯 Token 字符串（包含 eyJ 或长字符串）
+                if not app_user_token:
+                    if "eyJ" in cookie:
+                        for part in cookie.split(";"):
+                            part = part.strip()
+                            if "eyJ" in part:
+                                app_user_token = part.split("=", 1)[-1].strip()
+                                break
+                    elif "=" not in cookie and len(cookie) >= 20:
+                        app_user_token = cookie.strip()
 
             if app_user_token and "app_user_token" not in cookie:
                 cookie = f"app_user_token={app_user_token}; {cookie}".strip()
@@ -399,6 +404,15 @@ class JYingCheckIn(_PluginBase):
                 token = data.get("token") or (data.get("user") or {}).get("token")
                 if token:
                     account["app_user_token"] = token
+                    account["cookie"] = f"app_user_token={token}; {account.get('cookie') or ''}".strip()
+                    clients = self._account_clients.get(account["key"]) or {}
+                    for name in ("session", "scraper", "curl_session"):
+                        c = clients.get(name)
+                        if c is not None:
+                            try:
+                                c.cookies.set("app_user_token", token, domain="www.jying.top")
+                            except Exception:
+                                pass
                     logger.info(f"聚影签到：{account['remark']} 自动登录成功，已获取 Token")
                     return True
                 logger.warning(f"聚影签到：{account['remark']} 登录响应无 token：{data}")

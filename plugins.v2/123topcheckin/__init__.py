@@ -384,8 +384,10 @@ class Top123CheckIn(_PluginBase):
             with sync_playwright() as p:
                 launch_kwargs: Dict[str, Any] = {"headless": True}
                 proxies = self._get_proxies()
-                if proxies and proxies.get("http"):
-                    launch_kwargs["proxy"] = {"server": proxies["http"]}
+                if proxies:
+                    proxy_server = proxies.get("http") or proxies.get("https")
+                    if isinstance(proxy_server, str) and proxy_server.strip():
+                        launch_kwargs["proxy"] = {"server": proxy_server.strip()}
 
                 browser = p.chromium.launch(**launch_kwargs)
                 try:
@@ -526,14 +528,18 @@ class Top123CheckIn(_PluginBase):
                 if proxies:
                     curl_session.proxies = proxies
                 for name, value in self._cookie_pairs(account["cookie"]):
-                    curl_session.cookies.set(name, value, domain="123.qsxy.top")
-            except Exception:
+                    try:
+                        curl_session.cookies.set(name, value, domain="123.qsxy.top")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning(f"123云盘臻藏阁签到：初始化 curl_cffi 失败：{exc}")
                 curl_session = None
 
         self._account_clients[key] = {
-            "session": session,
-            "scraper": scraper,
             "curl_session": curl_session,
+            "scraper": scraper,
+            "session": session,
         }
 
     def _close_account_clients(self, key: str):
@@ -554,10 +560,17 @@ class Top123CheckIn(_PluginBase):
 
     def _request(self, account: Dict[str, Any], method: str, url: str, **kwargs):
         clients = self._account_clients.get(account["key"]) or {}
-        client = clients.get("curl_session") or clients.get("scraper") or clients.get("session")
-        if client is None:
-            raise RuntimeError("账号 HTTP 会话未初始化")
-        return client.request(method=method, url=url, **kwargs)
+        errors = []
+        for name in ("curl_session", "scraper", "session"):
+            client = clients.get(name)
+            if client is None:
+                continue
+            try:
+                return client.request(method=method, url=url, **kwargs)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                logger.warning(f"123云盘臻藏阁签到：{account['remark']} 使用 {name} 请求失败：{exc}，尝试下一个客户端")
+        raise RuntimeError("；".join(errors) or "账号 HTTP 会话未初始化或请求均失败")
 
     def _result(
         self,
@@ -590,13 +603,45 @@ class Top123CheckIn(_PluginBase):
         time.sleep(delay)
 
     def _get_proxies(self) -> Optional[Dict[str, str]]:
-        if not self._use_proxy or not settings.PROXY:
+        if not self._use_proxy:
             return None
-        proxy_url = settings.PROXY
-        return {
-            "http": proxy_url,
-            "https": proxy_url,
-        }
+        proxy = getattr(settings, "PROXY", None)
+        if not proxy:
+            return None
+        if isinstance(proxy, str):
+            proxy = proxy.strip()
+            if proxy:
+                return {"http": proxy, "https": proxy}
+            return None
+        if isinstance(proxy, dict):
+            http_val = (
+                proxy.get("http")
+                or proxy.get("HTTP")
+                or proxy.get("https")
+                or proxy.get("HTTPS")
+                or proxy.get("all")
+                or proxy.get("ALL")
+            )
+            https_val = (
+                proxy.get("https")
+                or proxy.get("HTTPS")
+                or proxy.get("http")
+                or proxy.get("HTTP")
+                or proxy.get("all")
+                or proxy.get("ALL")
+            )
+            while isinstance(http_val, dict):
+                http_val = http_val.get("http") or http_val.get("https") or next(iter(http_val.values()), None)
+            while isinstance(https_val, dict):
+                https_val = https_val.get("https") or https_val.get("http") or next(iter(https_val.values()), None)
+
+            http_str = str(http_val or "").strip()
+            https_str = str(https_val or "").strip()
+            if http_str or https_str:
+                final_http = http_str or https_str
+                final_https = https_str or http_str
+                return {"http": final_http, "https": final_https}
+        return None
 
     def _save_results(self, results: List[Dict[str, Any]]):
         history = self.get_data("sign_history") or []

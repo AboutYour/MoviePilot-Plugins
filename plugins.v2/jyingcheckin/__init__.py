@@ -201,7 +201,7 @@ class JYingCheckIn(_PluginBase):
                     obj = json.loads(line)
                     if obj.get("enabled", True) is False:
                         continue
-                    cookie = str(obj.get("cookie") or "").strip()
+                    cookie = str(obj.get("cookie") or obj.get("token") or obj.get("app_user_token") or "").strip()
                     remark = str(obj.get("remark") or obj.get("name") or "").strip()
                 except Exception:
                     cookie = line
@@ -209,17 +209,30 @@ class JYingCheckIn(_PluginBase):
                 remark, cookie = [part.strip() for part in line.split("#", 1)]
             elif "|" in line and "=" in line.split("|", 1)[1] and "=" not in line.split("|", 1)[0]:
                 remark, cookie = [part.strip() for part in line.split("|", 1)]
+            elif "#" in line and "=" not in line:
+                remark, cookie = [part.strip() for part in line.split("#", 1)]
 
             if cookie.lower().startswith("cookie:"):
                 cookie = cookie.split(":", 1)[1].strip()
 
-            pairs = self._cookie_pairs(cookie)
-            if not pairs:
-                logger.warning(f"聚影签到：第 {idx} 行 Cookie 格式无效，已跳过")
-                continue
-
+            # 提取 csrftoken 与 app_user_token
             csrftoken = self._extract_cookie_val(cookie, "csrftoken")
-            app_user_token = self._extract_cookie_val(cookie, "app_user_token")
+            app_user_token = (
+                self._extract_cookie_val(cookie, "app_user_token")
+                or self._extract_cookie_val(cookie, "token")
+                or self._extract_cookie_val(cookie, "jwt")
+                or self._extract_cookie_val(cookie, "access_token")
+            )
+
+            # 如果用户直接粘贴了纯 Token 字符串（无 '=' 且长度 >= 20）
+            if not app_user_token and "=" not in cookie and len(cookie) >= 20:
+                app_user_token = cookie.strip()
+                cookie = f"app_user_token={app_user_token};"
+
+            pairs = self._cookie_pairs(cookie)
+            if not pairs and not app_user_token:
+                logger.warning(f"聚影签到：第 {idx} 行凭证格式无效，已跳过")
+                continue
 
             account_index = len(accounts) + 1
             if not remark:
@@ -288,8 +301,31 @@ class JYingCheckIn(_PluginBase):
         finally:
             self._close_account_clients(account["key"])
 
+    def _ensure_csrftoken(self, account: Dict[str, Any]):
+        if account.get("csrftoken"):
+            return
+        try:
+            resp = self._request(
+                account,
+                "get",
+                "https://www.jying.top/api/csrf/",
+                headers={"User-Agent": self.USER_AGENT, "Referer": self.CHECKIN_PAGE_URL},
+                timeout=10,
+            )
+            # 从响应或 cookies 中提取 csrftoken
+            for name, val in resp.cookies.items():
+                if name.lower() == "csrftoken" and val:
+                    account["csrftoken"] = val
+                    logger.info(f"聚影签到：{account['remark']} 已自动获取 csrftoken")
+                    break
+        except Exception:
+            pass
+
     def _sign_account(self, account: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"聚影签到：正在签到 {account['remark']}")
+
+        # 补全 csrftoken（如未手动提供）
+        self._ensure_csrftoken(account)
 
         if self._use_browser:
             browser_result = self._sign_via_playwright(account)
@@ -719,10 +755,14 @@ class JYingCheckIn(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         example = (
-            "# 方式1：直接粘贴 Cookie（支持回车分隔多行）\n"
-            "csrftoken=43s2HQnUr6DifCdxtDk0C9zF1mtGEErG; ...\n\n"
-            "# 方式2：备注#Cookie\n"
-            "我的聚影账号#csrftoken=43s2HQnUr6DifCdxtDk0C9zF1mtGEErG; ..."
+            "# 【必填】聚影使用 app_user_token 作为用户登录凭证：\n"
+            "# 获取方法：登录 jying.top 后按 F12 ->「应用」(Application) ->「本地存储空间」(Local Storage) -> 点击 https://www.jying.top -> 复制 app_user_token 的值\n\n"
+            "# 填写示例 1（直接填 Token）：\n"
+            "app_user_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...;\n\n"
+            "# 填写示例 2（完整凭证）：\n"
+            "app_user_token=eyJhbGci...; csrftoken=43s2HQnUr6DifCdxtDk0C9zF1mtGEErG;\n\n"
+            "# 填写示例 3（带备注）：\n"
+            "我的聚影账号#app_user_token=eyJhbGci...;"
         )
         return [{
             "component": "VForm",
